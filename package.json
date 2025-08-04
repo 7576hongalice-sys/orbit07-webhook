@@ -1,13 +1,14 @@
 {
   "name": "orbit07-webhook",
   "version": "1.0.0",
+  "description": "Telegram bot webhook server for ORBIT-07",
   "main": "webhook_server.js",
   "scripts": {
     "start": "node webhook_server.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
-    "body-parser": "^1.20.0",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2"
   }
 }
