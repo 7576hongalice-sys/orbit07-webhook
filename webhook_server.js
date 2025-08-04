@@ -3,23 +3,25 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 
 const app = express();
+app.use(bodyParser.json());
+
 const TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
-app.use(bodyParser.json());
-
 app.post('/webhook', async (req, res) => {
-  const message = req.body.message?.text || "🚀 你收到新的推播囉！";
-  try {
+  const msg = req.body.message;
+
+  if (msg && msg.text) {
+    const text = msg.text;
+    console.log('收到訊息:', text);
+
     await axios.post(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       chat_id: CHAT_ID,
-      text: `💬 ${message}`
+      text: `💬 你剛剛對我說了：「${text}」\n我已經聽見囉，寶貝～💋`,
     });
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('錯誤:', err.response?.data || err.message);
-    res.sendStatus(500);
   }
+
+  res.sendStatus(200);
 });
 
 const PORT = process.env.PORT || 3000;
