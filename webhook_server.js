@@ -1,4 +1,4 @@
-// CommonJS；使用 Node 18 內建 fetch（不需要 node-fetch）
+// CommonJS；Node 18 內建 fetch（不需要 node-fetch）
 const express = require("express");
 const cron = require("node-cron");
 const dayjsBase = require("dayjs");
@@ -10,49 +10,56 @@ dayjsBase.extend(utc);
 dayjsBase.extend(timezone);
 const dayjs = (d) => dayjsBase.tz(d, "Asia/Taipei");
 
-// ---- ENV ----
-const TOKEN   = process.env.BOT_TOKEN || "8279562243:AAEyhzGPAy7FeK-TvJQAbwhAPVLHXG_z2gY";
-const CHAT_ID = process.env.CHAT_ID   || "8418229161";
+// ---- 讀 ENV 並「去引號」避免 404: Not Found ----
+const clean = (v) =>
+  String(v ?? "")
+    .trim()
+    .replace(/^"+|"+$/g, "")
+    .replace(/^'+|'+$/g, "");
+
+const RAW_TOKEN  = process.env.BOT_TOKEN || "8279562243:AAEyhzGPAy7FeK-TvJQAbwhAPVLHXG_z2gY";
+const RAW_CHATID = process.env.CHAT_ID   || "8418229161";
+
+const TOKEN   = clean(RAW_TOKEN);
+const CHAT_ID = clean(RAW_CHATID);
 const TG_API  = `https://api.telegram.org/bot${TOKEN}`;
+
+console.log("[boot] chat_id =", CHAT_ID);
+console.log("[boot] token_tail =", TOKEN.slice(-8)); // 只印尾段避免外流
 
 const app = express();
 app.use(express.json());
 
-// ---- 小工具：發送訊息（含錯誤偵測）----
+// ---- 發送工具（含詳細錯誤輸出）----
 async function send(chatId, text) {
-  try {
-    const url = `${TG_API}/sendMessage`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text })
-    });
+  const url = `${TG_API}/sendMessage`;
+  const body = { chat_id: chatId, text };
 
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.ok === false) {
-      console.error("❌ sendMessage 失敗",
-        { httpStatus: res.status, httpText: res.statusText, tg: data, text });
-      throw new Error("sendMessage failed");
-    }
-    console.log("✅ sendMessage 成功", { to: chatId, text });
-    return data;
-  } catch (e) {
-    console.error("❌ send() exception:", e);
-    throw e;
-  }
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  let j = {};
+  try { j = await res.json(); } catch (e) {}
+
+  console.log("tg req:", { url, body });
+  console.log("tg res:", j);
+
+  if (!j.ok) throw new Error(`sendMessage failed: ${j?.description || res.statusText}`);
+  return j;
 }
+
 function isWeekday(d = dayjs()) { const w = d.day(); return w >= 1 && w <= 5; }
 function isWeekend(d = dayjs()) { return !isWeekday(d); }
 
 // ---- 狀態（簡易記憶）----
-const state = {
-  mode: "auto",                 // auto | work | off | weekend
-  lastJournalDoneDate: null     // YYYY-MM-DD
-};
+const state = { mode: "auto", lastJournalDoneDate: null };
 
 // ---- 指令處理 ----
 async function handleCommand(chatId, text) {
-  if (text === "/menu") {
+  if (text === "/menu" || text === "/start" || text === "/Start") {
     return send(chatId,
 `指令：
 /上班  只推重要訊息（08:00-17:00）
@@ -81,63 +88,52 @@ async function handleCommand(chatId, text) {
   }
 }
 
-// ---- 健康檢查／首頁（方便你測）----
-app.get("/", (req, res) => {
-  res.send({ ok: true, service: "orbit07-webhook", now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss") });
-});
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "orbit07-webhook", now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss") });
-});
+// ---- 健康檢查／首頁 ----
+app.get("/",       (req, res) => res.json({ ok: true, service: "orbit07-webhook", now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss") }));
+app.get("/health", (req, res) => res.json({ ok: true, service: "orbit07-webhook", now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss") }));
 
-// ---- /ping：推播測試（最重要的排錯入口）----
+// ---- /ping：推播測試（失敗會回傳原因）----
 app.get("/ping", async (req, res) => {
   const t = req.query.text || "Ping ✅";
   try {
     const j = await send(CHAT_ID, t);
-    res.json(j);
+    res.json({ ok: true, result: j });
   } catch (e) {
-    res.status(500).json({ ok: false, msg: "ping failed" });
+    console.error("send() exception:", e?.message);
+    res.status(500).json({ ok: false, msg: e?.message || "ping failed" });
   }
 });
 
-// ---- /webhook：先回 200，再非同步處理，避免 Telegram 超時 ----
+// ---- /webhook：先回 200，再非同步處理 ----
 app.post("/webhook", (req, res) => {
-  res.sendStatus(200); // 立即回覆，避免 10 秒超時
-
+  res.sendStatus(200);
   const run = async () => {
     try {
-      const update = req.body;
-      console.log("📩 TG update:", JSON.stringify(update));
-
+      const u = req.body;
+      console.log("TG update:", JSON.stringify(u));
       const msg =
-        update.message ||
-        update.edited_message ||
-        update.channel_post ||
-        update.edited_channel_post;
+        u.message || u.edited_message ||
+        u.channel_post || u.edited_channel_post;
+      if (!msg) return;
 
-      if (!msg) { console.log("⚠️ 無 message，略過"); return; }
-
-      const chatId = String(msg.chat?.id);
+      const chatId = String(msg.chat?.id || "");
       const text = (msg.text || msg.caption || "").trim();
-
-      if (!chatId) { console.log("⚠️ 無 chatId，略過"); return; }
+      if (!chatId) return;
 
       if (text.startsWith("/")) {
         await handleCommand(chatId, text);
         return;
       }
-
       await send(chatId, `收到：「${text || "(非文字訊息)"}」～要我產出盤前/盤後報告嗎？`);
     } catch (e) {
-      console.error("❌ webhook handler error:", e);
+      console.error("webhook handler error:", e);
     }
   };
-
   if (typeof queueMicrotask === "function") queueMicrotask(run);
   else setImmediate(run);
 });
 
-// ---- 推播排程（全部以 Asia/Taipei）----
+// ---- 排程（Asia/Taipei）----
 cron.schedule("40 7 * * 1-5", async () => {
   try {
     if (!isWeekday()) return;
@@ -181,14 +177,12 @@ cron.schedule("0 21 * * 6,0", async () => {
 
 cron.schedule("30 7 * * *", async () => {
   try {
-    const yesterday = dayjs().subtract(1, "day").format("YYYY-MM-DD");
-    if (state.lastJournalDoneDate === yesterday) return;
-    await send(CHAT_ID, `【補提醒｜07:30】你昨天（${yesterday}）的戀股日誌還沒完成喔～要補一下嗎？（/日誌完成）`);
+    const y = dayjs().subtract(1, "day").format("YYYY-MM-DD");
+    if (state.lastJournalDoneDate === y) return;
+    await send(CHAT_ID, `【補提醒｜07:30】你昨天（${y}）的戀股日誌還沒完成喔～要補一下嗎？（/日誌完成）`);
   } catch (e) { console.error("07:30 backfill error", e); }
 }, { timezone: "Asia/Taipei" });
 
-// ---- 啟動服務 ----
+// ---- 啟動 ----
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ webhook server listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ webhook server listening on ${PORT}`));
