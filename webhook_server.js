@@ -18,6 +18,15 @@ const TG_API  = `https://api.telegram.org/bot${TOKEN}`;
 const app = express();
 app.use(express.json());
 
+// 健康檢查路由
+app.get("/", (req, res) => {
+  res.send({
+    status: "ok",
+    service: "orbit07-webhook",
+    now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss")
+  });
+});
+
 // ---- 小工具 ----
 async function send(chatId, text) {
   const url = `${TG_API}/sendMessage`;
