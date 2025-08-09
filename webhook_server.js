@@ -10,7 +10,7 @@ dayjsBase.extend(utc);
 dayjsBase.extend(timezone);
 const dayjs = (d) => dayjsBase.tz(d, "Asia/Taipei");
 
-// ---- 憑證（可被環境變數覆蓋）----
+// ---- ENV ----
 const TOKEN   = process.env.BOT_TOKEN || "8279562243:AAEyhzGPAy7FeK-TvJQAbwhAPVLHXG_z2gY";
 const CHAT_ID = process.env.CHAT_ID   || "8418229161";
 const TG_API  = `https://api.telegram.org/bot${TOKEN}`;
