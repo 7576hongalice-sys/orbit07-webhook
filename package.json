@@ -1,7 +1,7 @@
 {
   "name": "orbit07-webhook",
   "version": "2.0.0",
-  "description": "ORBIT-07 Telegram bot (Taipei-time schedules)",
+  "description": "ORBIT-07 Telegram bot (Taipei-time schedules, no node-fetch)",
   "main": "webhook_server.js",
   "scripts": {
     "start": "node webhook_server.js"
