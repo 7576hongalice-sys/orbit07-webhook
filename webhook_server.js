@@ -18,15 +18,28 @@ const TG_API  = `https://api.telegram.org/bot${TOKEN}`;
 const app = express();
 app.use(express.json());
 
-// ---- 小工具 ----
+// ---- 小工具：發送訊息（含錯誤偵測）----
 async function send(chatId, text) {
-  const url = `${TG_API}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text })
-  });
-  return res.json();
+  try {
+    const url = `${TG_API}/sendMessage`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text })
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      console.error("❌ sendMessage 失敗",
+        { httpStatus: res.status, httpText: res.statusText, tg: data, text });
+      throw new Error("sendMessage failed");
+    }
+    console.log("✅ sendMessage 成功", { to: chatId, text });
+    return data;
+  } catch (e) {
+    console.error("❌ send() exception:", e);
+    throw e;
+  }
 }
 function isWeekday(d = dayjs()) { const w = d.day(); return w >= 1 && w <= 5; }
 function isWeekend(d = dayjs()) { return !isWeekday(d); }
@@ -70,34 +83,31 @@ async function handleCommand(chatId, text) {
 
 // ---- 健康檢查／首頁（方便你測）----
 app.get("/", (req, res) => {
-  res.send({ status: "ok", service: "orbit07-webhook", now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss") });
+  res.send({ ok: true, service: "orbit07-webhook", now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss") });
 });
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "orbit07-webhook", now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss") });
 });
 
-// ---- /ping：推播測試 ----
+// ---- /ping：推播測試（最重要的排錯入口）----
 app.get("/ping", async (req, res) => {
   const t = req.query.text || "Ping ✅";
   try {
     const j = await send(CHAT_ID, t);
     res.json(j);
   } catch (e) {
-    console.error("ping error:", e);
-    res.status(500).send("ping failed");
+    res.status(500).json({ ok: false, msg: "ping failed" });
   }
 });
 
 // ---- /webhook：先回 200，再非同步處理，避免 Telegram 超時 ----
 app.post("/webhook", (req, res) => {
-  // 1) 立即回覆，避免 10 秒超時
-  res.sendStatus(200);
+  res.sendStatus(200); // 立即回覆，避免 10 秒超時
 
-  // 2) 非同步處理 update
   const run = async () => {
     try {
       const update = req.body;
-      console.log("TG update:", JSON.stringify(update));
+      console.log("📩 TG update:", JSON.stringify(update));
 
       const msg =
         update.message ||
@@ -105,32 +115,29 @@ app.post("/webhook", (req, res) => {
         update.channel_post ||
         update.edited_channel_post;
 
-      if (!msg) return;
+      if (!msg) { console.log("⚠️ 無 message，略過"); return; }
 
       const chatId = String(msg.chat?.id);
       const text = (msg.text || msg.caption || "").trim();
 
-      if (!chatId) return;
+      if (!chatId) { console.log("⚠️ 無 chatId，略過"); return; }
 
       if (text.startsWith("/")) {
         await handleCommand(chatId, text);
         return;
       }
 
-      // 一般訊息回覆（之後你要我接戀股/辰戀解析可再擴充）
       await send(chatId, `收到：「${text || "(非文字訊息)"}」～要我產出盤前/盤後報告嗎？`);
     } catch (e) {
-      console.error("webhook handler error:", e);
+      console.error("❌ webhook handler error:", e);
     }
   };
 
-  // 盡量把工作丟到事件 loop 後面執行
   if (typeof queueMicrotask === "function") queueMicrotask(run);
   else setImmediate(run);
 });
 
 // ---- 推播排程（全部以 Asia/Taipei）----
-// 07:40：盤前導航（平日）
 cron.schedule("40 7 * * 1-5", async () => {
   try {
     if (!isWeekday()) return;
@@ -145,7 +152,6 @@ cron.schedule("40 7 * * 1-5", async () => {
   } catch (e) { console.error("07:40 push error", e); }
 }, { timezone: "Asia/Taipei" });
 
-// 08:55：開盤補充（平日）
 cron.schedule("55 8 * * 1-5", async () => {
   try {
     if (!isWeekday()) return;
@@ -159,7 +165,6 @@ cron.schedule("55 8 * * 1-5", async () => {
   } catch (e) { console.error("08:55 push error", e); }
 }, { timezone: "Asia/Taipei" });
 
-// 16:00：平日收盤後日誌提醒
 cron.schedule("0 16 * * 1-5", async () => {
   try {
     if (!isWeekday()) return;
@@ -167,7 +172,6 @@ cron.schedule("0 16 * * 1-5", async () => {
   } catch (e) { console.error("16:00 reminder error", e); }
 }, { timezone: "Asia/Taipei" });
 
-// 21:00：週末日誌提醒
 cron.schedule("0 21 * * 6,0", async () => {
   try {
     if (!isWeekend()) return;
@@ -175,7 +179,6 @@ cron.schedule("0 21 * * 6,0", async () => {
   } catch (e) { console.error("21:00 weekend reminder error", e); }
 }, { timezone: "Asia/Taipei" });
 
-// 07:30：隔日補檢查（昨日未完成）
 cron.schedule("30 7 * * *", async () => {
   try {
     const yesterday = dayjs().subtract(1, "day").format("YYYY-MM-DD");
