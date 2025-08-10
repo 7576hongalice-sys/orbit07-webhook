@@ -10,6 +10,7 @@ const dayjs = (d) => dayjsBase.tz(d, "Asia/Taipei");
 
 const { addInbox, setSummary, getDay } = require("./db");
 const { initSymbols, refreshSymbols, DEFAULT_CACHE } = require("./symbols");
+const { getDailyClose } = require("./close_providers");
 
 // ===== Env =====
 const TOKEN          = process.env.BOT_TOKEN || "";
@@ -37,7 +38,8 @@ const ALLOW_HOSTS = new Set([
   "mis.twse.com.tw",      // 即時 MIS
   "isin.twse.com.tw",     // 名單
   "www.twse.com.tw",      // TWSE RWD（日線/日收）
-  "www.tpex.org.tw"       // TPEx（名單/日線）
+  "www.tpex.org.tw",      // TPEx
+  "tpex.org.tw"
 ]);
 global.fetch = async (url, opts) => {
   const host = (() => { try { return new URL(url).host; } catch { return ""; } })();
@@ -114,27 +116,7 @@ function summarizeLinkPreview(text, links) {
   return { codes, head, ls };
 }
 
-// ===== 價格來源：MIS 即時 + 日收盤備援 =====
-async function fetchTWSEDailyClose(code) {
-  try {
-    const dateYMD = dayjs().format("YYYYMMDD");
-    const u = new URL("https://www.twse.com.tw/rwd/zh/exchangeReport/STOCK_DAY");
-    u.search = new URLSearchParams({ response:"json", date: dateYMD, stockNo: code }).toString();
-    const r = await fetch(u.toString(), { headers: { "cache-control":"no-cache" } });
-    const j = await r.json().catch(()=>null);
-    const rows = j?.data || [];
-    if (!rows.length) return null;
-    const last = rows[rows.length - 1];
-    const num = s => parseFloat(String(s).replace(/,/g,""));
-    return {
-      open: num(last[3]), high: num(last[4]), low: num(last[5]), close: num(last[6]),
-      date: j.date || dayjs().format("YYYY/MM/DD"), market:"TWSE"
-    };
-  } catch(e){ console.error("[TWSE daily] err", e); return null; }
-}
-// TPEx 備援：先佔位，之後可換成你的實際端點（目前多數熱門股在 TWSE 足夠）
-async function fetchTPExDailyClose(_code){ return null; }
-
+// ===== MIS 即時 + 日收盤備援 =====
 async function fetchTWQuote(code) {
   const ts = Date.now();
   const endpoints = [
@@ -160,10 +142,8 @@ async function fetchTWQuote(code) {
       }
     } catch (e) {}
   }
-  // 備援：夜間/假日取日收盤
-  const daily = (marketTried === "TPEx")
-    ? (await fetchTPExDailyClose(code) || await fetchTWSEDailyClose(code))
-    : (await fetchTWSEDailyClose(code) || await fetchTPExDailyClose(code));
+  // MIS 無價（夜間/假日）→ 日收盤備援（TWSE / TPEx）
+  const daily = await getDailyClose(code, marketTried);
   if (daily) return { ok:true, code, name:"", ...daily };
   return { ok:false };
 }
@@ -200,6 +180,13 @@ ${wl}
 
 async function handleCommand(chatId, t) {
   const text = normInput(t);
+
+  // 除錯：/echo 看原始字元
+  if (/^\/echo\b/i.test(text)) {
+    const raw = t ?? "";
+    const codes = Array.from(raw).map(ch => ch.charCodeAt(0).toString(16).padStart(4,"0"));
+    return send(chatId, `RAW:${JSON.stringify(raw)}\nNORM:${JSON.stringify(text)}\nCODES:${codes.join(" ")}`);
+  }
 
   if (/^\/start|^\/menu/i.test(text)) {
     return send(chatId, "✅ 機器人上線。直接轉貼含連結的貼文：盤中 A 即時、盤後 C 彙整；查價請輸入「查 2330」或「股價 台積電」。");
@@ -245,19 +232,22 @@ async function handleCommand(chatId, t) {
     return send(chatId, ok ? `已新增別名：${code} ← ${names.join("、")}` : "新增別名失敗");
   }
 
-  // 查價：查 2330 / 股價 台積電 / 查 佳能
+  // 查價：查 2330 / 股價 台積電 / 查 佳能（容忍零寬/全形/斜線前綴）
   let q = null;
-  let m1 = text.match(/^\/?(查價|股價|查)\s+(.+)$/);
+  let m1 = text.match(/^[\u200B-\u200D\uFEFF\s/]*(查價|股價|查)\s+(.+)$/i);
   if (m1) q = m1[2].trim();
+
+  // 沒有關鍵字也嘗試撈 4~5 碼代號當兜底
+  const fallbackCode = !q ? (text.match(/\b\d{4,5}[A-Z]?\b/) || [])[0] : null;
   if (!q && (text === "查價" || text === "/股價")) {
     return send(chatId, "請輸入：查 代號或名稱（例：查 2330、股價 台積電、查 佳能）");
   }
-  if (q) {
+  if (q || fallbackCode) {
     const S = await ensureSymbols();
-    const hit = S.resolve(q);
+    const hit = q ? S.resolve(q) : S.resolve(fallbackCode);
     if (!hit) return send(chatId, "查無對應代號/名稱。");
     if (hit.suggest) {
-      return send(chatId, `找不到「${q}」，你要查的是：\n• ${hit.suggest.join("\n• ")}`);
+      return send(chatId, `找不到「${q||fallbackCode}」，你要查的是：\n• ${hit.suggest.join("\n• ")}`);
     }
     const r = await fetchTWQuote(hit.code);
     if (!r.ok) return send(chatId, `【${hit.code} ${hit.name || ""}】暫無取得到即時/日收資料，稍後再試。`);
@@ -292,7 +282,7 @@ app.post("/webhook", (req, res) => {
 
       // 指令 / 自然語句
       if (text?.startsWith("/")) { await handleCommand(chatId, text); return; }
-      if (/^(查價|股價|查)\s+/.test(text) || ["查價","清單","狀態"].includes(text)) {
+      if (/^[\u200B-\u200D\uFEFF\s/]*(查價|股價|查)\s+/.test(text) || ["查價","清單","狀態"].includes(text)) {
         await handleCommand(chatId, text); return;
       }
 
@@ -417,7 +407,7 @@ cron.schedule(PREMARKET_CRON, async () => {
   } catch (e) { console.error("[premarket] error", e); }
 }, { timezone: "Asia/Taipei" });
 
-// ===== Debug：手動刷新/盤後/查價 =====
+// ===== Debug：手動刷新/盤後/查價/echo =====
 app.get("/debug/refresh-symbols", async (_req, res) => {
   try { await refreshSymbols(SYMBOLS_PATH); SYM = null; res.json({ ok:true, msg:"refreshed" }); }
   catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
