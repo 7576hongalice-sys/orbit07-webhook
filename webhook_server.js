@@ -12,8 +12,8 @@ const { addInbox, setSummary, getDay } = require("./db");
 const { initSymbols, refreshSymbols, DEFAULT_CACHE } = require("./symbols");
 
 // ===== Env =====
-const TOKEN          = process.env.BOT_TOKEN || "";
-const OWNER_ID       = Number(process.env.OWNER_ID || 0);
+const TOKEN          = process.env.BOT_TOKEN || ""; (AAEyhzGPAy7FeK-TvJQAbwhAPVLHXG_z2gY)
+const OWNER_ID       = Number(process.env.OWNER_ID || 0); (8418229161)
 const GROUP_CHAT_ID  = process.env.GROUP_CHAT_ID || "";
 const DB_PATH        = process.env.DB_PATH || "/data/lover_stocks.json";
 const ANALYZE_MODE   = (process.env.ANALYZE_MODE || "BOTH").toUpperCase(); // A | C | BOTH
