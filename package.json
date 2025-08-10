@@ -1,12 +1,15 @@
 {
   "name": "orbit07-webhook",
-  "version": "3.0.0",
-  "description": "ORBIT-07 Telegram bot (secure env + startup self-check + retry)",
+  "version": "2.0.1",
+  "description": "ORBIT-07 Telegram bot (Taipei-time schedules, no node-fetch)",
+  "type": "commonjs",
   "main": "webhook_server.js",
   "scripts": {
     "start": "node webhook_server.js"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": "18.x"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "node-cron": "^3.0.3",
