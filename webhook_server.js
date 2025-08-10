@@ -1,4 +1,4 @@
-// CommonJS；Node 18 內建 fetch
+// Node 18+：內建 fetch
 const express = require("express");
 const cron = require("node-cron");
 const dayjsBase = require("dayjs");
@@ -10,169 +10,286 @@ dayjsBase.extend(utc);
 dayjsBase.extend(timezone);
 const dayjs = (d) => dayjsBase.tz(d, "Asia/Taipei");
 
-// ---- ENV（不要寫死）----
-const TOKEN   = process.env.BOT_TOKEN || "";
-const CHAT_ID = process.env.CHAT_ID   || "";
-const TG_API  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : "";
+// ================== 基本設定 ==================
+const TOKEN   = process.env.BOT_TOKEN || "8279562243:AAEyhzGPAy7FeK-TvJQAbwhAPVLHXG_z2gY";
+const TG_API  = `https://api.telegram.org/bot${TOKEN}`;
+// 你本人（辰戀核心TG；所有私訊、即時回覆、私密提醒）
+const CORE_CHAT_ID = process.env.CHAT_ID || "8418229161";
 
-const app = express();
-app.use(express.json());
+// 之後若要開給媽媽/群組，把對方 chat_id 放進來（目前先只你本人）
+const CORE_SUBSCRIBERS = new Set([CORE_CHAT_ID]);  // 私密通道
+const STOCKS_SUBSCRIBERS = new Set([CORE_CHAT_ID]); // 戀股主場TG（現在先同你，未來再加媽媽/群）
 
-// ---- 小工具 ----
-async function send(chatId, text) {
-  if (!TG_API) throw new Error("BOT_TOKEN 未設定");
+// ================== 名稱別名（名稱↔代號） ==================
+// 先放你常用與大票；之後可自動同步官方清單或用 /別名新增 補充
+const NAME_ALIASES = {
+  "鴻海": "2317", "鴻海精密": "2317",
+  "台積電": "2330", "臺積電": "2330", "台積": "2330",
+  "聯發科": "2454",
+  "佳能": "2374", "敬鵬": "2355", "富喬": "1815", "翔耀": "2438", "大成鋼": "2027",
+  "長榮航": "2618", "南仁湖": "5905", "力新": "5202", "玉山金": "2884",
+  "00687B": "00687B", "00937B": "00937B"
+};
+// 代號→名稱（顯示用；缺的先留空字串）
+const CODE_TO_NAME = {
+  "2317": "鴻海",
+  "2330": "台積電",
+  "2454": "聯發科",
+  "2374": "佳能",
+  "2355": "敬鵬",
+  "1815": "富喬",
+  "2438": "翔耀",
+  "2027": "大成鋼",
+  "2618": "長榮航",
+  "5905": "南仁湖",
+  "5202": "力新",
+  "2884": "玉山金",
+  "00687B": "國泰20年美債",
+  "00937B": "群益ESG投等債20+"
+};
+const normalizeName = s => (s || "").trim().replace(/\s+/g, "").replace(/台/g, "臺").toUpperCase();
+
+function resolveToCode(input) {
+  if (!input) return null;
+  const raw = String(input).trim();
+
+  // 已經是代號（4~5 碼 + 可選字母）
+  if (/^\d{4,5}[A-Z]?$/i.test(raw)) return raw.toUpperCase();
+
+  // 名稱直接/模糊
+  const norm = normalizeName(raw);
+  // 直接命中
+  if (NAME_ALIASES[norm]) return NAME_ALIASES[norm];
+
+  // 模糊包含
+  for (const [name, code] of Object.entries(NAME_ALIASES)) {
+    const nn = normalizeName(name);
+    if (nn.includes(norm) || norm.includes(nn)) return code;
+  }
+  return null;
+}
+const showCodeName = (code) => {
+  const nm = CODE_TO_NAME[code] || "";
+  return nm ? `${code} ${nm}` : `${code}`;
+};
+
+// ================== 環境狀態 / 功能開關 ==================
+const state = {
+  mode: "auto",                    // auto | work
+  oralQueryEnabled: true,          // 口語查價（私聊）：「查佳能」「股價 2330」
+  clipboxEnabled: true,            // 轉貼＝即時分析＋入庫
+  cooldownMinutes: 0,              // 速報冷卻（分鐘）；0 = 不節流
+  washReminderOn: true,
+  sleepReminderOn: true,
+  lastJournalDoneDate: null,       // YYYY-MM-DD
+  // 速報冷卻用：記錄來源最後推播時間
+  lastPushAtBySource: new Map()
+};
+
+// ================== Telegram 基本工具 ==================
+async function tgSend(chatId, text, options = {}) {
   const url = `${TG_API}/sendMessage`;
+  const body = { chat_id: chatId, text, parse_mode: "HTML", ...options };
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text })
+    body: JSON.stringify(body)
   });
-  const j = await res.json();
-  if (!j.ok) throw new Error(`sendMessage failed: ${JSON.stringify(j)}`);
-  return j;
+  return res.json();
 }
-const isWeekday = (d = dayjs()) => {
-  const w = d.day();
-  return w >= 1 && w <= 5;
-};
-const isWeekend = (d = dayjs()) => !isWeekday(d);
-
-// ---- 狀態（簡易記憶）----
-const state = {
-  mode: "auto",                 // auto | work | off | weekend
-  lastJournalDoneDate: null     // YYYY-MM-DD
-};
-
-// ---- 健康檢查／首頁 ----
-app.get("/", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "orbit07-webhook",
-    now_taipei: dayjs().format("YYYY-MM-DD HH:mm:ss")
+async function tgReplyKeyboard(chatId) {
+  // 常駐快捷鍵（Reply Keyboard）
+  const keyboard = [
+    [{ text: "查價" }, { text: "清單" }, { text: "追蹤收盤" }],
+    [{ text: "clip摘要 今日" }, { text: "clip清單" }],
+    [{ text: "狀態" }, { text: "上班" }, { text: "自動" }],
+    [{ text: "洗澡提醒" }, { text: "睡覺提醒" }]
+  ];
+  return tgSend(chatId, "功能列已就緒，直接點按即可；也可直接輸入「查佳能」「股價 2330」。", {
+    reply_markup: { keyboard, resize_keyboard: true, one_time_keyboard: false }
   });
-});
-app.get("/health", (req, res) => {
-  // Render Health Check 用，必須回 200
-  res.status(200).send("OK");
-});
+}
+async function tgForceAskCodeName(chatId) {
+  return tgSend(chatId, "請輸入「代號或名稱」：", {
+    reply_markup: { force_reply: true, input_field_placeholder: "例如：2374 或 佳能" }
+  });
+}
+async function notifyCore(text) {
+  for (const id of CORE_SUBSCRIBERS) { try { await tgSend(id, text); } catch (e) {} }
+}
+async function notifyStocks(text) {
+  for (const id of STOCKS_SUBSCRIBERS) { try { await tgSend(id, text); } catch (e) {} }
+}
 
-// ---- /ping：推播測試 ----
-app.get("/ping", async (req, res) => {
-  try {
-    const t = req.query.text || "Ping ✅";
-    const j = await send(CHAT_ID || String(req.query.chat_id || ""), t);
-    res.json({ ok: true, result: j });
-  } catch (e) {
-    console.error("send() exception:", e);
-    res.status(500).json({ ok: false, msg: "ping failed" });
+// ================== 行情抓取（收盤後 OHLC） ==================
+// TWSE 月資料（上市）
+async function fetchTwseMonthly(code, anyDay = new Date()) {
+  // TWSE 要 YYYYMMDD，但回傳當月所有天；我們用當月 01 即可
+  const y = dayjs(anyDay).format("YYYY");
+  const m = dayjs(anyDay).format("MM");
+  const url = `https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=${y}${m}01&stockNo=${code}`;
+  const r = await fetch(url, { headers: { "Accept": "application/json" }});
+  if (!r.ok) return null;
+  const j = await r.json().catch(()=>null);
+  if (!j || j.stat !== "OK" || !Array.isArray(j.data)) return null;
+
+  // 找到最後一筆有效資料
+  let last = null;
+  for (const row of j.data) {
+    const [d, , , open, high, low, close] = row;
+    const o = Number(String(open).replace(/[,--]/g,""));
+    const h = Number(String(high).replace(/[,--]/g,""));
+    const l = Number(String(low).replace(/[,--]/g,""));
+    const c = Number(String(close).replace(/[,--]/g,""));
+    if (!isFinite(c) || c === 0) continue;
+    last = { date: d, open: o, high: h, low: l, close: c, source: "TWSE" };
   }
-});
+  return last;
+}
 
-// ---- 指令處理 ----
-async function handleCommand(chatId, text) {
-  if (text === "/menu" || text === "/start" || text === "/Start") {
-    return send(chatId,
+// TPEx 月資料（上櫃）——簡化版，若失敗回 null（之後可再強化）
+async function fetchTpexMonthly(code, anyDay = new Date()) {
+  // TPEx 要民國年與 YYYY/MM；試常見 endpoint
+  const rocY = (dayjs(anyDay).year() - 1911).toString();
+  const mm = dayjs(anyDay).format("MM");
+  const rocYm = `${rocY}/${mm}`;
+  const url = `https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d=${rocYm}&stkno=${code}`;
+  const r = await fetch(url, { headers: { "Accept": "application/json" }});
+  if (!r.ok) return null;
+  const j = await r.json().catch(()=>null);
+  const arr = j?.aaData || j?.data || [];
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+
+  // 兼容不同欄位順序的常見格式
+  let last = null;
+  for (const row of arr) {
+    // 常見 row 可能是：["113/08/08","成交張數","成交金額","開盤","最高","最低","收盤",...]
+    const d = String(row[0] || "").trim();
+    const open = Number(String(row[3] || "").replace(/[,--]/g,""));
+    const high = Number(String(row[4] || "").replace(/[,--]/g,""));
+    const low  = Number(String(row[5] || "").replace(/[,--]/g,""));
+    const close= Number(String(row[6] || "").replace(/[,--]/g,""));
+    if (!isFinite(close) || close === 0) continue;
+    last = { date: d, open, high, low, close, source: "TPEx" };
+  }
+  return last;
+}
+
+async function getDailyOHLC(code) {
+  // 先試 TWSE，再試 TPEx
+  const tw = await fetchTwseMonthly(code).catch(()=>null);
+  if (tw) return tw;
+  const tp = await fetchTpexMonthly(code).catch(()=>null);
+  if (tp) return tp;
+  return null;
+}
+
+// ================== ClipBox（轉貼＝即時分析＋入庫） ==================
+const clips = []; // 簡單記憶；之後可擴成檔案或 DB
+function sourceGuess(msg) {
+  // 先看 Telegram 的 forward 標籤
+  const fwdFrom = msg.forward_from_chat?.title || msg.forward_from?.username || msg.forward_sender_name;
+  if (fwdFrom) return fwdFrom;
+
+  const text = (msg.text || msg.caption || "");
+  const urls = (text.match(/https?:\/\/\S+/g) || []).join(" ").toLowerCase();
+  if (urls.includes("facebook.com") || urls.includes("fb.watch")) return "Facebook";
+  if (urls.includes("t.me/")) return "Telegram";
+  if (urls.includes("line.me") || urls.includes("liff.line.me") || urls.includes("today.line.me")) return "LINE";
+
+  return null; // 讓外層去套用「最近一次 /clip來源」
+}
+
+// 簡易要點萃取（不依賴 GPT）：取前幾行、抓代號/名稱
+function quickTLDR(text) {
+  const lines = String(text || "").split(/\n+/).map(s=>s.trim()).filter(Boolean);
+  const top = lines.slice(0, 3); // 取 3 行當摘要
+  const tickers = new Set();
+  // 抓 4~5 碼數字（股票代號）與常見名稱（來自別名表）
+  (text.match(/\b\d{4,5}[A-Z]?\b/g) || []).forEach(v => tickers.add(v.toUpperCase()));
+  for (const [name, code] of Object.entries(NAME_ALIASES)) {
+    const re = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    if (re.test(text)) tickers.add(code);
+  }
+  const tickList = Array.from(tickers).map(c => showCodeName(c)).join("、");
+  return {
+    bullets: top,
+    tickers: Array.from(tickers),
+    tickList
+  };
+}
+
+function withinCooldown(sourceKey) {
+  if (!state.cooldownMinutes || state.cooldownMinutes <= 0) return false;
+  const now = Date.now();
+  const last = state.lastPushAtBySource.get(sourceKey || "general") || 0;
+  const diffMin = (now - last) / 60000;
+  if (diffMin < state.cooldownMinutes) return true;
+  state.lastPushAtBySource.set(sourceKey || "general", now);
+  return false;
+}
+
+async function handleClipAndInstantReply(msg) {
+  if (!state.clipboxEnabled) return;
+
+  const chatId = String(msg.chat.id);
+  const isPrivate = msg.chat.type === "private";
+
+  // 判斷來源
+  let src = sourceGuess(msg);
+  // 若沒有來源，看看使用者最近是否指定過 /clip來源（這版先省略快取，直接標「未標記來源」）
+  if (!src) src = "未標記來源";
+
+  // 擷取文字（文字或圖片 caption）
+  const text = (msg.text || msg.caption || "(無文字內容)");
+  const tldr = quickTLDR(text);
+
+  // 寫入 ClipBox
+  const rec = {
+    time: dayjs().format("YYYY-MM-DD HH:mm:ss"),
+    from_chat: msg.chat.title || msg.chat.username || msg.chat.first_name || "",
+    source: src,
+    text,
+    tickers: tldr.tickers
+  };
+  clips.push(rec);
+
+  // 即時回覆（依冷卻決定是否推送長文）
+  const header = `【即時解析】${src}｜${rec.time}`;
+  if (withinCooldown(src)) {
+    // 節流中：只簡短回覆
+    await tgSend(chatId, `${header}\n（已收錄，多則來訊節流中…）\n抓到標的：${tldr.tickList || "—"}`);
+    return;
+  }
+
+  // 完整 TL;DR
+  const bullets = tldr.bullets.length ? tldr.bullets.map((b,i)=>`${i+1}. ${b}`).join("\n") : "（暫無文字重點）";
+  const body = `${header}\n${bullets}\n\n抓到標的：${tldr.tickList || "—"}`;
+  await tgSend(chatId, body);
+}
+
+// ================== 指令處理 ==================
+async function handleCommand(chatId, text, msg) {
+  // 統一小工具
+  const askCodeFlow = () => tgForceAskCodeName(chatId);
+
+  // ---- 主選單（也會送出常駐快捷鍵）----
+  if (text === "/start" || text === "/menu") {
+    await tgReplyKeyboard(chatId);
+    return tgSend(chatId,
 `可用指令：
 /上班  只推重要訊息（08:00-17:00）
 /自動  平/假日自動判斷
-/日誌完成  標記今日完成
-/狀態  檢視目前設定`);
+/狀態  檢視目前設定
+/股價  代號或名稱（例：/股價 2374 或 /股價 佳能）
+/口語查價開｜/口語查價關
+/clip開｜/clip關
+/速報冷卻 分鐘（例：/速報冷卻 10）`);
   }
-  if (text === "/上班")    { state.mode = "work";    return send(chatId, "已切換：上班模式 ✅"); }
-  if (text === "/自動")    { state.mode = "auto";    return send(chatId, "已切換：自動模式 ✅"); }
-  if (text === "/日誌完成") {
-    state.lastJournalDoneDate = dayjs().format("YYYY-MM-DD");
-    return send(chatId, `已標記今日日誌完成（${state.lastJournalDoneDate}）👍`);
-  }
-  if (text === "/狀態") {
-    return send(chatId,
-`模式：${state.mode}
-台北時間：${dayjs().format("YYYY-MM-DD HH:mm")}
-上班：平日 08:00–17:00
-盤前導航：07:40（平日）
-開盤補充：08:55（平日）
-日誌提醒：平日16:30；週末21:00；隔日07:30 補查`);
-  }
-}
 
-// ---- Webhook：先回 200，再非同步處理 ----
-app.post("/webhook", (req, res) => {
-  // 立即回 200，避免 Telegram 10 秒超時
-  res.sendStatus(200);
+  // ---- 模式 ----
+  if (text === "/上班")    { state.mode = "work"; return tgSend(chatId, "已切換：上班模式 ✅"); }
+  if (text === "/自動")    { state.mode = "auto"; return tgSend(chatId, "已切換：自動模式 ✅"); }
 
-  const run = async () => {
-    try {
-      const update = req.body || {};
-      // console.log("TG update:", JSON.stringify(update)); // 如需除錯再打開
-
-      const msg =
-        update.message ||
-        update.edited_message ||
-        update.channel_post ||
-        update.edited_channel_post;
-
-      if (!msg) return;
-
-      const chatId = String(msg.chat?.id || "");
-      const text = (msg.text || msg.caption || "").trim();
-
-      if (!chatId) return;
-
-      if (text.startsWith("/")) {
-        await handleCommand(chatId, text);
-        return;
-      }
-
-      // 一般訊息回覆（placeholder）
-      await send(chatId, `收到：「${text || "(非文字訊息)"}」～要我產出盤前/盤後報告嗎？`);
-    } catch (e) {
-      console.error("webhook handler error:", e);
-    }
-  };
-
-  if (typeof queueMicrotask === "function") queueMicrotask(run);
-  else setImmediate(run);
-});
-
-// ---- 推播排程（以 Asia/Taipei）----
-cron.schedule("40 7 * * 1-5", async () => {
-  try {
-    if (!isWeekday()) return;
-    await send(CHAT_ID, "【盤前導航｜07:40】（模板）");
-  } catch (e) { console.error("07:40 push error", e); }
-}, { timezone: "Asia/Taipei" });
-
-cron.schedule("55 8 * * 1-5", async () => {
-  try {
-    if (!isWeekday()) return;
-    await send(CHAT_ID, "【開盤補充｜08:55】（模板）");
-  } catch (e) { console.error("08:55 push error", e); }
-}, { timezone: "Asia/Taipei" });
-
-cron.schedule("30 16 * * 1-5", async () => {
-  try {
-    if (!isWeekday()) return;
-    await send(CHAT_ID, "【提醒】收盤囉～要不要記今天的戀股日誌？（/日誌完成）");
-  } catch (e) { console.error("16:30 reminder error", e); }
-}, { timezone: "Asia/Taipei" });
-
-cron.schedule("0 21 * * 6,0", async () => {
-  try {
-    if (!isWeekend()) return;
-    await send(CHAT_ID, "【提醒】今晚要不要補本週的戀股日誌與策略？（/日誌完成）");
-  } catch (e) { console.error("21:00 weekend reminder error", e); }
-}, { timezone: "Asia/Taipei" });
-
-cron.schedule("30 7 * * *", async () => {
-  try {
-    const yesterday = dayjs().subtract(1, "day").format("YYYY-MM-DD");
-    if (state.lastJournalDoneDate === yesterday) return;
-    await send(CHAT_ID, `【補提醒｜07:30】你昨天（${yesterday}）的戀股日誌還沒完成喔～要補一下嗎？（/日誌完成）`);
-  } catch (e) { console.error("07:30 backfill error", e); }
-}, { timezone: "Asia/Taipei" });
-
-// ---- 啟動服務（重點：用 Render 提供的 PORT）----
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ webhook server listening on ${PORT}`);
-});
+  // ---- 開關 ----
+  if (text === "/口語查價開") { state.oralQueryEnabled = 
