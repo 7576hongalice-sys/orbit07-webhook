@@ -1,17 +1,15 @@
 {
   "name": "orbit07-webhook",
-  "version": "2.1.0",
-  "description": "ORBIT-07 Telegram bot (Taipei-time schedules, reply keyboard, oral query, ClipBox)",
+  "version": "3.0.0",
+  "description": "ORBIT-07 Telegram bot (secure env + startup self-check + retry)",
   "main": "webhook_server.js",
   "scripts": {
     "start": "node webhook_server.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "dayjs": "^1.11.11",
     "express": "^4.19.2",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "dayjs": "^1.11.11"
   }
 }
