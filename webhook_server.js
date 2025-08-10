@@ -1,4 +1,4 @@
-// webhook_server.js — ORBIT-07 全開版
+// webhook_server.js — ORBIT-07（全開＋隱藏張數版）
 // Node 18 內建 fetch；Express webhook + Taipei cron + Telegram Bot
 const express = require("express");
 const cron = require("node-cron");
@@ -8,7 +8,7 @@ const timezone = require("dayjs/plugin/timezone");
 dayjsBase.extend(utc); dayjsBase.extend(timezone);
 const dayjs = (d)=>dayjsBase.tz(d, "Asia/Taipei");
 
-// ===== 憑證（環境變數優先）=====
+// ===== 憑證（環境變數優先；以下為你的預設值）=====
 const TOKEN   = process.env.BOT_TOKEN || "8279562243:AAEyhzGPAy7FeK-TvJQAbwhAPVLHXG_z2gY";
 const CHAT_ID = process.env.CHAT_ID   || "8418229161";
 const TG_API  = `https://api.telegram.org/bot${TOKEN}`;
@@ -39,23 +39,26 @@ async function edit(chatId, msgId, text, extra={}){
 // ===== 小工具 =====
 const isWeekday = (d=dayjs()) => { const w=d.day(); return w>=1 && w<=5; };
 const isWeekend = (d=dayjs()) => !isWeekday(d);
-const nowStr = ()=> dayjs().format("YYYY-MM-DD HH:mm:ss");
 const todayKey = ()=> dayjs().format("YYYY-MM-DD");
 
 // ===== 名稱 ↔ 代號（別名表：可再擴）=====
 const NAME_ALIASES = {
   // 你的清單
-  "長榮航":"2618","南仁湖":"5905","力新":"5202","玉山金":"2884","佳能":"2374","敬鵬":"2355","富喬":"1815","世紀":"5314","翔耀":"2438","廣達":"2382","大成鋼":"2027",
+  "長榮航":"2618","南仁湖":"5905","力新":"5202","玉山金":"2884","佳能":"2374","敬鵬":"2355",
+  "富喬":"1815","世紀":"5314","翔耀":"2438","廣達":"2382","大成鋼":"2027",
   "00687B":"00687B","00937B":"00937B",
   // 常見
-  "台積電":"2330","臺積電":"2330","TSMC":"2330","鴻海":"2317","聯發科":"2454","台達電":"2308","聯電":"2303","中鋼":"2002","富邦金":"2881","國泰金":"2882",
-  "長榮":"2603","陽明":"2609","萬海":"2615","華航":"2610","友達":"2409","群創":"3481","緯創":"3231","技嘉":"2376"
+  "台積電":"2330","臺積電":"2330","TSMC":"2330","鴻海":"2317","聯發科":"2454","台達電":"2308","聯電":"2303",
+  "中鋼":"2002","富邦金":"2881","國泰金":"2882","長榮":"2603","陽明":"2609","萬海":"2615",
+  "華航":"2610","友達":"2409","群創":"3481","緯創":"3231","技嘉":"2376"
 };
 const CODE_TO_NAME = {
-  "2618":"長榮航","5905":"南仁湖","5202":"力新","2884":"玉山金","2374":"佳能","2355":"敬鵬","1815":"富喬","5314":"世紀","2438":"翔耀","2382":"廣達","2027":"大成鋼",
+  "2618":"長榮航","5905":"南仁湖","5202":"力新","2884":"玉山金","2374":"佳能","2355":"敬鵬",
+  "1815":"富喬","5314":"世紀","2438":"翔耀","2382":"廣達","2027":"大成鋼",
   "00687B":"國泰20年美債","00937B":"群益ESG投等債20+",
-  "2330":"台積電","2317":"鴻海","2454":"聯發科","2308":"台達電","2303":"聯電","2002":"中鋼","2881":"富邦金","2882":"國泰金",
-  "2603":"長榮","2609":"陽明","2615":"萬海","2610":"華航","2409":"友達","3481":"群創","3231":"緯創","2376":"技嘉"
+  "2330":"台積電","2317":"鴻海","2454":"聯發科","2308":"台達電","2303":"聯電",
+  "2002":"中鋼","2881":"富邦金","2882":"國泰金","2603":"長榮","2609":"陽明","2615":"萬海",
+  "2610":"華航","2409":"友達","3481":"群創","3231":"緯創","2376":"技嘉"
 };
 const normalizeName = s => (s||"").trim().replace(/\s+/g,"").replace(/台/g,"臺").toUpperCase();
 function resolveToCode(input){
@@ -80,8 +83,7 @@ async function fetchTwseMonthly(code, anyDay=new Date()){
   if(!r.ok) return null; const j=await r.json().catch(()=>null);
   if(!j||j.stat!=="OK"||!Array.isArray(j.data)) return null;
   const rows=j.data.map(row=>{
-    const [d,, ,o,h,l,c]=row;
-    const n=v=>Number(String(v).replace(/[,--]/g,""));
+    const [d,, ,o,h,l,c]=row; const n=v=>Number(String(v).replace(/[,--]/g,""));
     return { date:d, open:n(o), high:n(h), low:n(l), close:n(c) };
   }).filter(x=>isFinite(x.close)&&x.close>0);
   if(!rows.length) return null;
@@ -120,25 +122,23 @@ async function getBatchQuotes(codes){
   return out;
 }
 
-// ===== 使用者狀態／資料 =====
+// ===== 使用者狀態／資料（張數不顯示，但可儲存）=====
 const state = {
   // 模式與提醒
   mode:"auto", bathOn:true, sleepOn:true,
   // 盤中即時（A 模式）
-  immediateOn:true, cooldownMin:5, lastPushAt:0,
-  // 日誌
-  lastJournalDoneDate:null,
+  immediateOn:true, cooldownMin:5,
   // 清單
   watch:new Set(["2355","2374","1815","5314","2438","2382","2027"]),
   hold:{ "2618":{}, "5905":{}, "5202":{}, "2884":{}, "00687B":{}, "00937B":{} },
-  // Clip 資料盒（今日）
-  clips:{},  // key=YYYY-MM-DD -> [{t, kind, platform, text, urls, codes}]
-  // 合併推播（冷卻期間彙整）
-  burst:{ active:false, start:0, timer:null, items:[] }
+  // Clip 資料（每日）
+  clips:{},
+  // 冷卻彙整
+  burst:{ timer:null, items:[] }
 };
-function clipsToday(){ const k=todayKey(); state.clips[k] = state.clips[k]||[]; return state.clips[k]; }
+function clipsToday(){ const k=todayKey(); state.clips[k]=state.clips[k]||[]; return state.clips[k]; }
 
-// ===== 平台與內容偵測（clip）=====
+// ===== Clip 偵測 =====
 function extractUrls(text){ if(!text) return []; const m=text.match(/https?:\/\/\S+/g); return m||[]; }
 function detectPlatform(text){
   const s=(text||"").toLowerCase();
@@ -150,9 +150,7 @@ function detectPlatform(text){
 }
 function detectCodes(text){
   const found=new Set();
-  // 代號
   (text.match(/\b\d{4}\b/g)||[]).forEach(c=>found.add(c));
-  // 名稱
   const norm=normalizeName(text);
   for(const [name,code] of Object.entries(NAME_ALIASES)){
     const nn=normalizeName(name);
@@ -161,11 +159,10 @@ function detectCodes(text){
   return Array.from(found);
 }
 function markHits(codes){
-  const a=[]; for(const c of codes){
+  return codes.map(c=>{
     const hit = state.watch.has(c) || !!state.hold[c];
-    a.push(hit? `${showCodeName(c)}✅` : showCodeName(c));
-  }
-  return a.join("、");
+    return hit? `${showCodeName(c)}✅` : showCodeName(c);
+  }).join("、");
 }
 function pushClipFromMessage(msg){
   const text=(msg.text||msg.caption||"").trim();
@@ -183,19 +180,18 @@ async function tgReplyKeyboard(chatId){
     [{text:"查價"},{text:"清單"},{text:"clip 摘要 今日"}],
     [{text:"狀態"},{text:"上班"},{text:"自動"}],
   ];
-  return send(chatId,"功能列已就緒。查價可輸入「股價 2330／查 佳能」。",{
+  return send(chatId,"功能列就緒。查價可輸入「股價 2330／查 佳能」。",{
     reply_markup:{ keyboard, resize_keyboard:true, is_persistent:true }
   });
 }
 
 // ===== 內嵌按鈕（清單用）=====
 function inlineRowFor(code, listType){
-  const kb = { inline_keyboard: [[
+  return { inline_keyboard: [[
     { text:"查價", callback_data:`PRICE:${code}` },
     { text:"移除", callback_data:`REMOVE:${listType}:${code}` },
     ...(listType==="hold" ? [{ text:"設成本", callback_data:`SETCOST:${code}` }] : [])
   ]]};
-  return kb;
 }
 
 // ===== 清單（排序／篩選／匯出）=====
@@ -229,8 +225,8 @@ async function showList(chatId, options={}){
   const quotes=await getBatchQuotes(codes);
   const rows=items.map(it=>{
     const q=quotes[it.code]; const close=q?.close??null; const chgPct=q?.chgPct??null;
-    const cost=state.hold[it.code]?.cost??null; const shares=state.hold[it.code]?.shares??null;
-    const pnlPct=(cost&&close)? ((close-cost)/cost*100):null;
+    const cost=state.hold[it.code]?.cost??null;
+    const pnlPct=(cost&&close)? ((close-cost)/cost*100):null; // 張數不使用
     return { ...it, close, chgPct, pnlPct };
   });
   const num=v=> typeof v==="number"?v : (v==null?null:Number(String(v).replace(/%/g,"")));
@@ -263,27 +259,26 @@ async function showList(chatId, options={}){
   if(arr.length>max) await send(chatId, `其餘 ${arr.length-max} 檔略。你可用「清單 追蹤」或排序／篩選縮小範圍。`);
 }
 
-// ===== A 模式：即時逐則解析（含冷卻合併）=====
+// ===== A 模式：盤中即時（含冷卻彙整）=====
 function inWorkHours(){
   const h=Number(dayjs().format("H")); const w=isWeekday();
   return w && h>=8 && h<17;
 }
 function scheduleBurstSend(chatId){
-  if(state.burst.timer) return; // 已排
+  if(state.burst.timer) return;
   state.burst.timer = setTimeout(async ()=>{
     try{
       const items = state.burst.items.splice(0);
-      state.burst.active=false; state.burst.timer=null;
+      state.burst.timer=null;
       if(!items.length) return;
       const n=items.length;
-      // 彙整 symbols
       const symSet=new Set(); items.forEach(it=> it.codes.forEach(c=>symSet.add(c)));
       const syms=Array.from(symSet).slice(0,12).map(c=>showCodeName(c)).join("、") || "—";
       const platforms={}; items.forEach(it=> platforms[it.platform]=(platforms[it.platform]||0)+1);
       const pfTxt = Object.entries(platforms).map(([k,v])=>`${k} ${v}`).join("、");
       await send(chatId, `【即時彙整｜${dayjs().format("MM/DD HH:mm")}】共 ${n} 則（${pfTxt}）\n標的：${syms}`);
     }catch(e){ console.error("burst send error:",e); }
-  }, state.cooldownMin*60*1000);
+  }, Math.max(0, state.cooldownMin)*60*1000);
 }
 async function pushImmediateCard(chatId, meta){
   const title = `【即時解析】${meta.platform}｜${dayjs().format("YYYY-MM-DD HH:mm")}`;
@@ -293,18 +288,15 @@ async function pushImmediateCard(chatId, meta){
   await send(chatId, body);
 }
 function handleImmediateFlow(chatId, meta){
-  // 入 burst 池
   state.burst.items.push({ codes:meta.codes, platform:meta.platform });
-  state.burst.active=true;
   scheduleBurstSend(chatId);
-  // 推播策略
-  if(!state.immediateOn) return;               // 全關 → 不推
-  if(inWorkHours()){                            // 上班 → 精簡一句
+  if(!state.immediateOn) return;
+  if(inWorkHours()){ // 上班：回精簡
     const hit = meta.codes.length? `標的：${markHits(meta.codes)}` : "標的：—";
     send(chatId, `【即時解析｜精簡】${hit}`);
     return;
   }
-  // 非上班 → 完整卡
+  // 非上班：完整卡
   pushImmediateCard(chatId, meta);
 }
 
@@ -321,7 +313,6 @@ async function showClipSummaryToday(chatId){
   const pfTxt = Object.entries(platforms).map(([k,v])=>`${k} ${v}`).join("、");
   const syms = Array.from(sym).slice(0,20).map(c=>showCodeName(c)).join("、") || "—";
   const head = `【今日 clip 摘要｜${dayjs().format("MM/DD")}】\n• 收到：${arr.length} 則（${pfTxt}）\n• 涉及股票：${syms}\n• 時間範圍：${dayjs(firstTs).format("HH:mm")}–${dayjs(lastTs).format("HH:mm")}`;
-  // 最新 → 最舊 列前 10
   const lines = arr.slice(-10).reverse().map((it,i)=>{
     const sn = (it.text||"").replace(/\s+/g," ").slice(0,28) || (it.kind==="圖片"?"[圖片]":"[內容]");
     const s = it.codes.length? `｜${it.codes.map(c=>CODE_TO_NAME[c]||c).slice(0,3).join("/")}` : "";
@@ -338,7 +329,8 @@ async function tgReplyMenu(chatId){
 /上班｜/自動｜狀態
 /股價 代號或名稱（例：/股價 2374 或 /股價 佳能）
 /追蹤新增 代號或名稱｜/追蹤移除 代號或名稱
-/持股設定 代號 成本 35.5 [張數 3]
+/持股設定 代號 成本 35.5
+/轉持股 代號 [成本 35.5]｜/轉追蹤 代號
 /即時開｜/即時關｜/速報冷卻 5
 
 清單強化：
@@ -351,7 +343,7 @@ async function tgReplyMenu(chatId){
 「收盤彙整 立即」（同義：追蹤收盤 立即）`);
 }
 
-// ===== 指令處理（含無斜線快捷）=====
+// ===== 指令處理 =====
 async function handleCommand(chatId, rawText){
   if(!rawText) return null;
   const text = rawText.trim();
@@ -382,41 +374,69 @@ async function handleCommand(chatId, rawText){
   if(["即時開","immediate on"].includes(lower)){ state.immediateOn=true; await send(chatId,"盤中即時解析：已開 ✅"); return {handled:true}; }
   if(["即時關","immediate off"].includes(lower)){ state.immediateOn=false; await send(chatId,"盤中即時解析：已關 🚫"); return {handled:true}; }
   if(tNoSlash.startsWith("速報冷卻")){
-    const m=tNoSlash.match(/速報冷卻\s+(\d+)/); if(!m) return send(chatId,"用法：/速報冷卻 5（單位：分鐘；0＝關閉冷卻）");
+    const m=tNoSlash.match(/速報冷卻\s*([0-9]+)/); if(!m) return send(chatId,"用法：/速報冷卻 5（單位：分鐘；0＝關閉冷卻）");
     state.cooldownMin=Math.max(0, Number(m[1])); await send(chatId,`冷卻已設為 ${state.cooldownMin} 分鐘`);
     return {handled:true};
   }
 
-  // 洗澡／睡覺提醒開關
+  // 生活提醒開關
   if(["洗澡提醒開","bath on"].includes(lower)){ state.bathOn=true; await send(chatId,"21:30 洗澡提醒已啟用 ✅"); return {handled:true}; }
   if(["洗澡提醒關","bath off"].includes(lower)){ state.bathOn=false; await send(chatId,"21:30 洗澡提醒已關閉 🚫"); return {handled:true}; }
   if(["睡覺提醒開","sleep on"].includes(lower)){ state.sleepOn=true; await send(chatId,"23:00 睡覺提醒已啟用 ✅"); return {handled:true}; }
   if(["睡覺提醒關","sleep off"].includes(lower)){ state.sleepOn=false; await send(chatId,"23:00 睡覺提醒已關閉 🚫"); return {handled:true}; }
 
-  // 追蹤新增／移除
+  // 追蹤新增／移除（名稱或代號都可）
   if(tNoSlash.startsWith("追蹤新增")){
     const q=tNoSlash.split(/\s+/).slice(1).join(" ");
     const code=resolveToCode(q); if(!code) return send(chatId,`找不到「${q}」的代號。`);
-    state.watch.add(code); await send(chatId,`已加入追蹤：${showCodeName(code)}`); return {handled:true};
+    if(state.hold[code]) delete state.hold[code]; // 若本來在持股，移出
+    state.watch.add(code);
+    await send(chatId,`已加入追蹤：${showCodeName(code)}`);
+    return {handled:true};
   }
   if(tNoSlash.startsWith("追蹤移除")){
     const q=tNoSlash.split(/\s+/).slice(1).join(" ");
     const code=resolveToCode(q); if(!code) return send(chatId,`找不到「${q}」的代號。`);
-    state.watch.delete(code); await send(chatId,`已移除追蹤：${showCodeName(code)}`); return {handled:true};
+    state.watch.delete(code);
+    await send(chatId,`已移除追蹤：${showCodeName(code)}`);
+    return {handled:true};
   }
 
-  // 持股設定 代號 成本 35.5 張數 3
+  // 轉持股／轉追蹤
+  if(tNoSlash.startsWith("轉持股")){
+    const rest=tNoSlash.replace(/^轉持股/,"").trim();
+    const q=rest.split(/\s+/)[0]; const code=resolveToCode(q);
+    if(!code) return send(chatId,"用法：/轉持股 代號 [成本 35.5]");
+    // 可選成本
+    const mCost = rest.match(/成本\s*([0-9]+(?:\.[0-9]+)?)/);
+    state.watch.delete(code);
+    state.hold[code] = state.hold[code] || {};
+    if(mCost) state.hold[code].cost = Number(mCost[1]);
+    await send(chatId,`已轉至持股：${showCodeName(code)}${mCost?`｜成本 ${mCost[1]}`:""}`);
+    return {handled:true};
+  }
+  if(tNoSlash.startsWith("轉追蹤") || tNoSlash.startsWith("出清")){
+    const rest=tNoSlash.replace(/^轉追蹤|^出清/,"").trim();
+    const q=rest.split(/\s+/)[0]; const code=resolveToCode(q);
+    if(!code) return send(chatId,"用法：/轉追蹤 代號");
+    delete state.hold[code]; // 清掉成本
+    state.watch.add(code);
+    await send(chatId,`已轉回追蹤：${showCodeName(code)}`);
+    return {handled:true};
+  }
+
+  // 持股設定（新增或更新；自動從追蹤移到持股；張數不顯示）
   if(tNoSlash.startsWith("持股設定")){
     const parts=tNoSlash.split(/\s+/).slice(1);
     const q=parts[0]; const code=resolveToCode(q);
-    if(!code) return send(chatId,"格式：/持股設定 代號 成本 35.5 [張數 3]");
+    if(!code) return send(chatId,"用法：/持股設定 代號 成本 35.5");
     const txt=tNoSlash.slice(tNoSlash.indexOf(q)+q.length).trim();
     const mCost = txt.match(/成本\s*([0-9]+(?:\.[0-9]+)?)/);
-    const mShares = txt.match(/張數\s*([0-9]+(?:\.[0-9]+)?)/);
+    if(!mCost) return send(chatId,"請提供成本，例如：/持股設定 2374 成本 74.5");
+    state.watch.delete(code);                // 自動遷移：追蹤 → 持股
     state.hold[code]= state.hold[code] || {};
-    if(mCost) state.hold[code].cost = Number(mCost[1]);
-    if(mShares) state.hold[code].shares = Number(mShares[1]);
-    await send(chatId,`已更新持股：${showCodeName(code)}${mCost?`｜成本 ${mCost[1]}`:""}${mShares?`｜張數 ${mShares[1]}`:""}`);
+    state.hold[code].cost = Number(mCost[1]);
+    await send(chatId,`已更新持股：${showCodeName(code)}｜成本 ${mCost[1]}`);
     return {handled:true};
   }
 
@@ -430,10 +450,12 @@ async function handleCommand(chatId, rawText){
       if(opt.type==="all"||opt.type==="watch") for(const c of Array.from(state.watch)) if(!state.hold[c]) codes.push(c);
       const quotes=await getBatchQuotes(codes);
       const rows=codes.map(code=>{
-        const q=quotes[code]; const close=q?.close??""; const chgPct=q?.chgPct==null? "": q.chgPct.toFixed(2);
-        const cost=state.hold[code]?.cost??""; const shares=state.hold[code]?.shares??"";
+        const q=quotes[code];
+        const close=q?.close??"";
+        const chgPct=q?.chgPct==null? "": q.chgPct.toFixed(2);
+        const cost=state.hold[code]?.cost??"";
         const pnl=(cost&&close)? (((close-cost)/cost*100).toFixed(2)):"";
-        return {code,name:CODE_TO_NAME[code]||"",close,chgPct,cost,shares,pnl};
+        return {code,name:CODE_TO_NAME[code]||"",close,chgPct,cost,pnl};
       });
       // 排序
       if(opt.sortBy){
@@ -456,8 +478,8 @@ async function handleCommand(chatId, rawText){
         for(let i=rows.length-1;i>=0;i--) if(!pick(rows[i])) rows.splice(i,1);
       }
       if(opt.export==="CSV"){
-        const header="code,name,close,chg_pct,cost,shares,pnl_pct";
-        const lines=rows.map(r=>`${r.code},${r.name},${r.close},${r.chgPct},${r.cost},${r.shares},${r.pnl}`);
+        const header="code,name,close,chg_pct,cost,pnl_pct";
+        const lines=rows.map(r=>`${r.code},${r.name},${r.close},${r.chgPct},${r.cost},${r.pnl}`);
         const csv=[header,...lines].join("\n");
         await send(chatId, `【清單匯出（${typeText}）CSV】\n<code>${csv}</code>`, { disable_web_page_preview:true });
       }else{
@@ -488,7 +510,6 @@ async function handleCommand(chatId, rawText){
 
   // 手動：收盤彙整 立即（同義：追蹤收盤 立即）
   if(/^(收盤彙整\s*立即|追蹤收盤\s*立即)$/i.test(tNoSlash)){
-    // 以 16:30 收盤為準，彙整「持股＋追蹤」
     const holdCodes=Object.keys(state.hold);
     const watchOnly = Array.from(state.watch).filter(c=>!state.hold[c]);
     const allCodes=[...holdCodes, ...watchOnly];
@@ -543,7 +564,7 @@ app.post("/webhook",(req,res)=>{
         }
         if(data.startsWith("SETCOST:")){
           const code=data.split(":")[1];
-          await send(chatId,`請回覆：/持股設定 ${code} 成本 35.5 張數 3（張數可省略）`);
+          await send(chatId,`請回覆：/持股設定 ${code} 成本 35.5`);
           return;
         }
         return;
@@ -561,8 +582,16 @@ app.post("/webhook",(req,res)=>{
 
       // 2) 一般訊息（轉貼/文字/圖片）→ A 模式：入庫 + 推播策略
       const meta = pushClipFromMessage(msg);
-      handleImmediateFlow(chatId, meta);
-
+      // 上班：精簡；非上班：完整；同時啟動冷卻彙整
+      if(state.immediateOn){
+        if(isWeekday() && Number(dayjs().format("H"))>=8 && Number(dayjs().format("H"))<17){
+          const hit = meta.codes.length? `標的：${markHits(meta.codes)}` : "標的：—";
+          await send(chatId, `【即時解析｜精簡】${hit}`);
+        }else{
+          await pushImmediateCard(chatId, meta);
+        }
+      }
+      scheduleBurstSend(chatId);
     }catch(e){ console.error("webhook handler error:", e); }
   };
   if(typeof queueMicrotask==="function") queueMicrotask(run); else setImmediate(run);
@@ -587,21 +616,14 @@ cron.schedule("55 8 * * 1-5", async ()=>{ try{ if(!isWeekday()) return;
   await send(CHAT_ID,`【開盤補充｜08:55】（模板）`);
 }catch(e){} }, { timezone:"Asia/Taipei" });
 
-// 16:30：收盤後日誌提醒（平日）
+// 16:30：收盤後提醒（平日）
 cron.schedule("30 16 * * 1-5", async ()=>{ try{ if(!isWeekday()) return;
-  await send(CHAT_ID,"【提醒】收盤囉～要不要記今天的戀股日誌？（回覆 日誌完成）");
+  await send(CHAT_ID,"【提醒】收盤囉～要不要記今天的戀股日誌？");
 }catch(e){} }, { timezone:"Asia/Taipei" });
 
-// 21:30／23:00 生活提醒（每日）
+// 21:30／23:00 生活提醒（每日，可關）
 cron.schedule("30 21 * * *", async ()=>{ try{ if(state.bathOn)  await send(CHAT_ID,"【提醒】21:30 到了，去洗澡放鬆一下～🛁"); }catch(e){} }, { timezone:"Asia/Taipei" });
 cron.schedule("0 23 * * *",  async ()=>{ try{ if(state.sleepOn) await send(CHAT_ID,"【提醒】23:00 到了，收心上床睡覺囉～😴"); }catch(e){} }, { timezone:"Asia/Taipei" });
-
-// 07:30：隔日補檢查（昨日未完成）
-cron.schedule("30 7 * * *", async ()=>{ try{
-  const y=dayjs().subtract(1,"day").format("YYYY-MM-DD");
-  if(state.lastJournalDoneDate===y) return;
-  await send(CHAT_ID, `【補提醒｜07:30】你昨天（${y}）的戀股日誌還沒完成喔～要補一下嗎？（日誌完成）`);
-}catch(e){} }, { timezone:"Asia/Taipei" });
 
 const PORT=process.env.PORT||3000;
 app.listen(PORT,()=>console.log(`✅ webhook server listening on ${PORT}`));
