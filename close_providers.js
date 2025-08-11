@@ -1,5 +1,4 @@
-// close_providers.js — 個股「日收盤」供應器（TWSE 正式 + TPEx 容錯）
-// Node 18+ 原生 fetch
+// close_providers.js — 個股「日收盤」供應器（TWSE 正式 + TPEx 容錯）for Cloud (Render)
 const dayjsBase = require("dayjs");
 const utc = require("dayjs/plugin/utc");
 const timezone = require("dayjs/plugin/timezone");
@@ -12,7 +11,7 @@ const NUM = (s) => {
 };
 const lastTruthy = (arr) => { for (let i = arr.length - 1; i >= 0; i--) if (arr[i]) return arr[i]; return null; };
 
-// ---- TWSE：官方 RWD 日線（穩定）----
+// ---- TWSE：官方 RWD 日線 ----
 async function getDailyCloseTWSE(code) {
   try {
     const ymd = dayjs().format("YYYYMMDD");
@@ -29,24 +28,22 @@ async function getDailyCloseTWSE(code) {
   } catch (e) { console.error("[getDailyCloseTWSE] err", e); return null; }
 }
 
-// ---- TPEx：多端點容錯（JSON/CSV 都試）----
+// ---- TPEx：多端點容錯（JSON / CSV）----
 async function getDailyCloseTPEx(code) {
   const ymd = dayjs().format("YYYYMMDD");
   const ym  = dayjs().format("YYYY/MM");
   const candidates = [
-    // JSON 端點（不同環境可能有其一可用）
     `https://www.tpex.org.tw/openapi/v1/tpex_mainboard_stock_day?stockNo=${code}&date=${ymd}`,
     `https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close?stockNo=${code}&date=${ymd}`,
-    // 舊站 CSV：st43 下載
     `https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_download.php?stkno=${code}&d=${ym}`
   ];
   for (const url of candidates) {
     try {
       const r = await fetch(url, { headers: { "cache-control":"no-cache" } });
       if (!r.ok) continue;
-      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      const ctype = (r.headers.get("content-type") || "").toLowerCase();
 
-      if (ct.includes("json")) { // JSON 解析
+      if (ctype.includes("json")) {
         const j = await r.json().catch(()=>null);
         const rows = Array.isArray(j) ? j : (j?.data || []);
         if (!rows.length) continue;
@@ -58,29 +55,28 @@ async function getDailyCloseTPEx(code) {
         const date  = (last.date ?? last["日期"] ?? dayjs().format("YYYY/MM/DD"));
         if (close == null) continue;
         return { market:"TPEx", date, open, high, low, close };
-      } else { // CSV 解析
-        const txt = await r.text();
-        const lines = txt.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-        for (let i = lines.length - 1; i >= 0; i--) {
-          const cols = lines[i].split(/,|;|\t/).map(s=>s.trim());
-          if (cols.length < 6) continue;
-          const tryParse = (arr, di, oi) => {
-            const date = arr[di] || arr[di+1] || "";
-            const open = NUM(arr[oi]), high = NUM(arr[oi+1]), low = NUM(arr[oi+2]), close = NUM(arr[oi+3]);
-            return [open,high,low,close].every(v=>v!=null) ? { date, open, high, low, close } : null;
-          };
-          const parsed = tryParse(cols, 0, 3) || tryParse(cols, 1, 4);
-          if (parsed) return { market:"TPEx", ...parsed };
-        }
       }
-    } catch (e) {
-      console.warn("[getDailyCloseTPEx] candidate fail:", url, String(e).slice(0,120));
-    }
+
+      // CSV 容錯（st43_download）
+      const txt = await r.text();
+      const lines = txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const cols = lines[i].split(/,|;|\t/).map(s=>s.trim());
+        if (cols.length < 6) continue;
+        const tryParse = (arr, di, oi) => {
+          const date = arr[di] || arr[di+1] || "";
+          const open = NUM(arr[oi]), high = NUM(arr[oi+1]), low = NUM(arr[oi+2]), close = NUM(arr[oi+3]);
+          return [open,high,low,close].every(v => v !== null) ? { date, open, high, low, close } : null;
+        };
+        const parsed = tryParse(cols, 0, 3) || tryParse(cols, 1, 4) || null;
+        if (parsed) return { market:"TPEx", ...parsed };
+      }
+    } catch (e) { console.warn("[getDailyCloseTPEx] candidate fail:", url, String(e).slice(0,120)); }
   }
   return null;
 }
 
-/** 智慧選源：有 marketHint 先試該市場；否則 TWSE → TPEx */
+// ---- 智慧選源 ----
 async function getDailyClose(code, marketHint) {
   if (marketHint === "TPEx") return (await getDailyCloseTPEx(code)) || (await getDailyCloseTWSE(code));
   return (await getDailyCloseTWSE(code)) || (await getDailyCloseTPEx(code));
