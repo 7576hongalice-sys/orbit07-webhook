@@ -1,0 +1,21 @@
+{
+  "name": "orbit07-bot-starter",
+  "version": "1.0.0",
+  "description": "Telegram push bot (webhook) with cron schedules for Asia/Taipei, built for 戀股主場",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dayjs": "^1.11.11",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
