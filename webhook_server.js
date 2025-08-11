@@ -1,4 +1,5 @@
-// webhook_server.js — ORBIT07 Cloud (Render): A/C + 盤前導航 + 群組推播 + JSON DB + 查價修復
+// webhook_server.js — ORBIT07 (A/C + 盤前導航 + 群組推播 + JSON DB + 查價修復)
+// Node18+（原生 fetch）
 const express = require("express");
 const cron = require("node-cron");
 const dayjsBase = require("dayjs");
@@ -11,34 +12,33 @@ const { addInbox, setSummary, getDay } = require("./db");
 const { initSymbols, refreshSymbols, DEFAULT_CACHE } = require("./symbols");
 const { getDailyClose } = require("./close_providers");
 
-// ===== Cloud Envs (Render 後台設定) =====
+// ===== Env =====
 const TOKEN          = process.env.BOT_TOKEN || "";
 const OWNER_ID       = Number(process.env.OWNER_ID || 0);
-const GROUP_CHAT_ID  = process.env.GROUP_CHAT_ID || "";             // -100xxxxxxxxxx（群組），或留空只私訊
+const GROUP_CHAT_ID  = process.env.GROUP_CHAT_ID || "";
 const DB_PATH        = process.env.DB_PATH || "/data/inbox.json";
 const ANALYZE_MODE   = (process.env.ANALYZE_MODE || "BOTH").toUpperCase(); // A | C | BOTH
 const CRON_SUMMARY   = process.env.CRON_SUMMARY || "30 16 * * 1-5";        // 盤後彙整
 const SYMBOLS_PATH   = process.env.SYMBOLS_PATH || DEFAULT_CACHE;
 const PREMARKET_CRON = process.env.PREMARKET_CRON || "15 7 * * 1-5";       // 盤前導航 07:15
-const PORT           = process.env.PORT || 3000;
 
 if (!TOKEN) console.warn("[WARN] BOT_TOKEN 未設定");
 if (!OWNER_ID) console.warn("[WARN] OWNER_ID 未設定（將無法入庫）");
-if (!GROUP_CHAT_ID) console.warn("[WARN] GROUP_CHAT_ID 未設定（群組推播停用）");
+if (!GROUP_CHAT_ID) console.warn("[WARN] GROUP_CHAT_ID 未設定（無法推播到群組）");
 
 const TG_API  = `https://api.telegram.org/bot${TOKEN}`;
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ===== 僅允許必要對外主機 =====
+// ===== 安全白名單：只放行必要外連 =====
 const _fetch = global.fetch;
 const ALLOW_HOSTS = new Set([
-  "api.telegram.org",
-  "mis.twse.com.tw",
-  "isin.twse.com.tw",
-  "www.twse.com.tw",
-  "www.tpex.org.tw",
+  "api.telegram.org",     // Telegram
+  "mis.twse.com.tw",      // 即時 MIS
+  "isin.twse.com.tw",     // 名單
+  "www.twse.com.tw",      // TWSE RWD（日線/日收）
+  "www.tpex.org.tw",      // TPEx
   "tpex.org.tw"
 ]);
 global.fetch = async (url, opts) => {
@@ -76,15 +76,23 @@ async function tgSend(chatId, text, extra = {}) {
   } catch (e) { console.error("[tgSend] err", e); }
 }
 
+// ===== UI：常駐鍵盤 =====
 function replyKeyboard() {
-  return { reply_markup: { keyboard: [[{ text:"查價" }, { text:"清單" }, { text:"狀態" }]], resize_keyboard: true, is_persistent: true } };
+  return {
+    reply_markup: {
+      keyboard: [[{ text:"查價" }, { text:"清單" }, { text:"狀態" }]],
+      resize_keyboard: true, is_persistent: true
+    }
+  };
 }
 const send = (chatId, text) => tgSend(chatId, text, replyKeyboard());
 
 // ===== 文字/連結處理 =====
 function normInput(s = "") {
-  return String(s).replace(/[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/g, " ")
-                  .replace(/\s+/g, " ").trim();
+  return String(s)
+    .replace(/[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 function extractLinks(text = "", entities = []) {
   const urls = [];
@@ -134,15 +142,20 @@ async function fetchTWQuote(code) {
       }
     } catch (e) {}
   }
+  // MIS 無價（夜間/假日）→ 日收盤備援（TWSE / TPEx）
   const daily = await getDailyClose(code, marketTried);
   if (daily) return { ok:true, code, name:"", ...daily };
   return { ok:false };
 }
 
 // ===== 指令處理 =====
-let SYM = null;
-async function ensureSymbols() { if (!SYM) SYM = await initSymbols(SYMBOLS_PATH); return SYM; }
+let SYM = null; // symbols 索引
+async function ensureSymbols() {
+  if (!SYM) SYM = await initSymbols(SYMBOLS_PATH);
+  return SYM;
+}
 
+// 盤前渲染器
 function renderPremarket({ date, summary, watchlist=[] }) {
   const intl = (summary?.intl || []).map(s=>`  • ${s}`).join("\n") || "  • —";
   const chips = summary?.chips || {};
@@ -168,13 +181,15 @@ ${wl}
 async function handleCommand(chatId, t) {
   const text = normInput(t);
 
+  // 除錯：/echo 看原始字元
   if (/^\/echo\b/i.test(text)) {
     const raw = t ?? "";
     const codes = Array.from(raw).map(ch => ch.charCodeAt(0).toString(16).padStart(4,"0"));
     return send(chatId, `RAW:${JSON.stringify(raw)}\nNORM:${JSON.stringify(text)}\nCODES:${codes.join(" ")}`);
   }
+
   if (/^\/start|^\/menu/i.test(text)) {
-    return send(chatId, "✅ 機器人上線。查價：輸入「查 2330」或「股價 台積電」。");
+    return send(chatId, "✅ 機器人上線。直接轉貼含連結的貼文：盤中 A 即時、盤後 C 彙整；查價請輸入「查 2330」或「股價 台積電」。");
   }
   if (text === "狀態" || text === "/狀態") {
     return send(chatId,
@@ -185,8 +200,10 @@ async function handleCommand(chatId, t) {
 資料庫：${DB_PATH}
 清單：${SYMBOLS_PATH}`);
   }
-  if (text === "清單" || text === "/清單") return send(chatId, "（清單功能待補）");
-
+  if (text === "清單" || text === "/清單") {
+    return send(chatId, "（清單功能待補，不影響 A/C 與查價）");
+  }
+  // /today：立即給一版盤前導航
   if (/^\/today$/i.test(text)) {
     const todayISO = ymd();
     const yestISO  = dayjs().subtract(1, "day").format("YYYY-MM-DD");
@@ -204,12 +221,24 @@ async function handleCommand(chatId, t) {
     return send(chatId, renderPremarket(payload));
   }
 
-  // 查價：容忍零寬/全形/斜線前綴
+  // /別名 2374 佳能 Canon
+  if (/^\/別名\s+/i.test(text)) {
+    const m = text.replace(/^\/別名\s+/i, "").trim().split(/\s+/);
+    if (m.length < 2) return send(chatId, "格式：/別名 代號 名稱 [更多別名]");
+    const [code, ...names] = m;
+    const S = await ensureSymbols();
+    const ok = await S.addAlias(code, ...names);
+    SYM = null;
+    return send(chatId, ok ? `已新增別名：${code} ← ${names.join("、")}` : "新增別名失敗");
+  }
+
+  // 查價：查 2330 / 股價 台積電 / 查 佳能（容忍零寬/全形/斜線前綴）
   let q = null;
   let m1 = text.match(/^[\u200B-\u200D\uFEFF\s/]*(查價|股價|查)\s+(.+)$/i);
   if (m1) q = m1[2].trim();
-  const fallbackCode = !q ? (text.match(/\b\d{4,5}[A-Z]?\b/) || [])[0] : null;
 
+  // 沒有關鍵字也嘗試撈 4~5 碼代號當兜底
+  const fallbackCode = !q ? (text.match(/\b\d{4,5}[A-Z]?\b/) || [])[0] : null;
   if (!q && (text === "查價" || text === "/股價")) {
     return send(chatId, "請輸入：查 代號或名稱（例：查 2330、股價 台積電、查 佳能）");
   }
@@ -217,11 +246,15 @@ async function handleCommand(chatId, t) {
     const S = await ensureSymbols();
     const hit = q ? S.resolve(q) : S.resolve(fallbackCode);
     if (!hit) return send(chatId, "查無對應代號/名稱。");
-    if (hit.suggest) return send(chatId, `找不到「${q||fallbackCode}」，你要查的是：\n• ${hit.suggest.join("\n• ")}`);
+    if (hit.suggest) {
+      return send(chatId, `找不到「${q||fallbackCode}」，你要查的是：\n• ${hit.suggest.join("\n• ")}`);
+    }
     const r = await fetchTWQuote(hit.code);
     if (!r.ok) return send(chatId, `【${hit.code} ${hit.name || ""}】暫無取得到即時/日收資料，稍後再試。`);
     const showName = r.name || hit.name || "";
-    const line = `【${hit.code} ${showName}｜${r.market}】 ${r.date} 收：${r.close}\n(開:${r.open} 高:${r.high} 低:${r.low})`;
+    const line =
+`【${hit.code} ${showName}｜${r.market}】 ${r.date} 收：${r.close}
+(開:${r.open} 高:${r.high} 低:${r.low})`;
     return send(chatId, line);
   }
 
@@ -247,15 +280,19 @@ app.post("/webhook", (req, res) => {
       const links  = extractLinks(text, entities);
       const source = detectForward(msg);
 
+      // 指令 / 自然語句
       if (text?.startsWith("/")) { await handleCommand(chatId, text); return; }
       if (/^[\u200B-\u200D\uFEFF\s/]*(查價|股價|查)\s+/.test(text) || ["查價","清單","狀態"].includes(text)) {
         await handleCommand(chatId, text); return;
       }
 
       const owner = isOwner(msg);
+
+      // 沒連結就簡短回覆
       if (!links.length && text) await send(chatId, `收到：「${text}」`);
       if (!links.length) return;
 
+      // 入庫（僅 OWNER）
       if (owner && DB_PATH) {
         await addInbox(DB_PATH, ymd(), {
           ts: dayjs().format("YYYY-MM-DD HH:mm"),
@@ -271,18 +308,27 @@ app.post("/webhook", (req, res) => {
         });
       }
 
+      // A 模式：盤中即時推播（僅 OWNER）
       const wantA = ANALYZE_MODE === "A" || ANALYZE_MODE === "BOTH";
       const inAWindow = currentMode(dayjsBase()) === "A";
       if (owner && wantA && inAWindow && GROUP_CHAT_ID) {
         const { codes, head, ls } = summarizeLinkPreview(text, links);
-        const body = `【A 即時】${dayjs().format("HH:mm")}\n來源：${source}\n重點：${head || "（無文字）"}\n代號：${codes.join("、") || "無"}\n連結：\n${ls || "無"}`;
+        const body =
+`【A 即時】${dayjs().format("HH:mm")}
+來源：${source}
+重點：${head || "（無文字）"}
+代號：${codes.join("、") || "無"}
+連結：
+${ls || "無"}`;
         await tgSend(GROUP_CHAT_ID, body);
       }
-    } catch (e) { console.error("[/webhook] error", e); }
+    } catch (e) {
+      console.error("[/webhook] error", e);
+    }
   })();
 });
 
-// ===== C 模式：盤後彙整 =====
+// ===== C 模式：盤後彙整 → 入庫 summary → 推播 =====
 cron.schedule(CRON_SUMMARY, async () => {
   try {
     const today = ymd();
@@ -299,23 +345,39 @@ cron.schedule(CRON_SUMMARY, async () => {
     const top_sources = Object.entries(bySrc).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`${k} x${v}`);
     const symbols = Array.from(symbolSet).slice(0,20);
 
-    const summary = { at: dayjs().format("YYYY-MM-DD HH:mm"), items: inbox.length, top_sources, symbols, highlights: [] };
+    const summary = {
+      at: dayjs().format("YYYY-MM-DD HH:mm"),
+      items: inbox.length,
+      top_sources,
+      symbols,
+      highlights: []
+    };
     await setSummary(DB_PATH, today, summary);
 
     if (GROUP_CHAT_ID) {
-      const msg = `【C 盤後彙整】${today}\n收件：${inbox.length} 則\n來源TOP：${top_sources.join("，") || "—"}\n關注代號：${symbols.join("、") || "—"}\n（已寫入戀股資料庫；07:15 會送出盤前導航）`;
+      const msg =
+`【C 盤後彙整】${today}
+收件：${inbox.length} 則
+來源TOP：${top_sources.join("，") || "—"}
+關注代號：${symbols.join("、") || "—"}
+（已寫入戀股資料庫；07:15 會送出盤前導航）`;
       await tgSend(GROUP_CHAT_ID, msg);
     }
-  } catch (e) { console.error("[C-summary] error", e); }
+  } catch (e) {
+    console.error("[C-summary] error", e);
+  }
 }, { timezone: "Asia/Taipei" });
 
-// ===== 每日 06:00 更新清單快取 =====
+// ===== 每日 06:00 更新清單快取（TWSE/TPEX 名單）=====
 cron.schedule("0 6 * * *", async () => {
-  try { await refreshSymbols(SYMBOLS_PATH); SYM = null; console.log("[symbols] refreshed:", SYMBOLS_PATH); }
-  catch (e) { console.error("[symbols] refresh error", e); }
+  try {
+    await refreshSymbols(SYMBOLS_PATH);
+    SYM = null;
+    console.log("[symbols] refreshed:", SYMBOLS_PATH);
+  } catch (e) { console.error("[symbols] refresh error", e); }
 }, { timezone: "Asia/Taipei" });
 
-// ===== 盤前導航：07:15 =====
+// ===== 盤前導航：每日 07:15 主動推播 =====
 cron.schedule(PREMARKET_CRON, async () => {
   try {
     if (!isWeekday(dayjsBase())) return;
@@ -329,19 +391,23 @@ cron.schedule(PREMARKET_CRON, async () => {
 
     const payload = {
       date: todayISO,
-      summary: { intl: yData.intl || [], chips: yData.chips || {}, nav: [
-        "9:15～9:30 觀察量能是否放大",
-        "弱勢不抄、強勢回測可接",
-      ]},
+      summary: {
+        intl: yData.intl || [],
+        chips: yData.chips || {},
+        nav: [
+          "9:15～9:30 觀察量能是否放大",
+          "弱勢不抄、強勢回測可接",
+        ],
+      },
       watchlist
     };
+
     await tgSend(GROUP_CHAT_ID, renderPremarket(payload));
     console.log("[premarket] sent", todayISO);
   } catch (e) { console.error("[premarket] error", e); }
 }, { timezone: "Asia/Taipei" });
 
-// ===== Debug 路由 =====
-app.get("/healthz", (_req, res) => res.status(200).json({ ok:true, service:"orbit07-webhook", now: now() }));
+// ===== Debug：手動刷新/盤後/查價/echo =====
 app.get("/debug/refresh-symbols", async (_req, res) => {
   try { await refreshSymbols(SYMBOLS_PATH); SYM = null; res.json({ ok:true, msg:"refreshed" }); }
   catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
@@ -352,6 +418,7 @@ app.get("/debug/run-summary", async (_req, res) => {
     const data = await getDay(DB_PATH, today);
     const inbox = (data.inbox || []).filter(it => it.from_id === OWNER_ID);
     if (!inbox.length) return res.json({ ok:true, msg:"今天 inbox 是空的" });
+
     const bySrc = {}; const symbolSet = new Set();
     inbox.forEach(it => { bySrc[it.source] = (bySrc[it.source]||0)+1; for (const s of (it.symbols||[])) symbolSet.add(s); });
     const top_sources = Object.entries(bySrc).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`${k} x${v}`);
@@ -370,4 +437,6 @@ app.get("/debug/price", async (req, res) => {
   } catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
 });
 
+// ===== 啟動 =====
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
