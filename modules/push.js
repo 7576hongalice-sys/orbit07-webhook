@@ -1,13 +1,21 @@
-export async function preOpen() {
-  // 之後會接你的盤前模板
-  return '〔盤前預言〕今天區間震盪，電子偏強、金融觀察量能。';
+import fetch from 'node-fetch';
+
+// 你的 repo 的 raw 路徑（分支是 main）
+const RAW_BASE = 'https://raw.githubusercontent.com/7576hongalice-sys/orbit07-webhook/main/content';
+
+// 讀取 content/*.txt 的小工具
+async function pull(name) {
+  try {
+    const r = await fetch(`${RAW_BASE}/${name}.txt`, { cache: 'no-store' });
+    if (!r.ok) throw new Error('fetch fail');
+    const t = (await r.text()).trim();
+    return t || `(${name} 還沒有內容)`;
+  } catch (e) {
+    return `(${name} 讀取失敗，請稍後再試)`;
+  }
 }
 
-export async function noonBrief() {
-  return '〔午盤小結〕量能平穩，AI 族群續表態，留意尾盤拉抬/回吐。';
-}
-
-export async function closeWrap() {
-  // 之後替換成實際收盤數據摘要
-  return '〔收盤總結〕加權平收、成交量略增，電子>傳產>金融。';
-}
+// 給 index.js 用的三個出口
+export async function preOpen()   { return await pull('preopen'); }
+export async function noonBrief() { return await pull('noon'); }
+export async function closeWrap() { return await pull('close'); }
