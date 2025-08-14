@@ -16,7 +16,11 @@ const API = `https://api.telegram.org/bot${TOKEN}`;
 const VERSION = '2025-08-14-01';
 
 app.get('/healthz', (req, res) => {
-  res.status(200).json({ ok: true, version: VERSION });
+  res.status(200).json({ 
+    ok: true, 
+    version: VERSION,
+    time: new Date().toString() // 這裡會顯示台灣時間
+  });
 });
 
 // Telegram Webhook entry
