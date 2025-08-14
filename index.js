@@ -1,4 +1,3 @@
-// index.js（覆蓋版）
 process.env.TZ = 'Asia/Taipei'; // 強制使用台灣時區
 
 import express from 'express';
@@ -6,6 +5,8 @@ import fetch from 'node-fetch';
 import { preOpen, noonBrief, closeWrap } from './modules/push.js';
 import { priceLookup } from './modules/price_lookup.js';
 import { saveForecast, compareWithClose } from './modules/forecast.js';
+import { makePreopenFromRaw } from './modules/ingest.js';
+import { publishToGitHub } from './modules/publisher.js';
 
 const app = express();
 app.use(express.json());
@@ -14,9 +15,9 @@ const TOKEN = process.env.TG_BOT_TOKEN;
 if (!TOKEN) console.warn('[WARN] TG_BOT_TOKEN is missing');
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
-const VERSION = '2025-08-15-01';
+const VERSION = '2025-08-15-02';
 
-// ⬇️ 送出底部「戀股主場」功能列
+// 送出底部「戀股主場」功能列
 async function sendMenu(chatId) {
   const keyboard = [
     [{ text: '🧭 戀股主場｜盤前導航 × 操作建議' }],
@@ -35,12 +36,51 @@ async function sendMenu(chatId) {
   });
 }
 
-app.get('/healthz', (req, res) => {
-  res.status(200).json({
-    ok: true,
-    version: VERSION,
-    time: new Date().toString() // 會顯示台灣時間
+// 長文分段（避免超過 Telegram 4096 字）
+async function sendLong(chatId, text) {
+  const MAX = 3800;
+  let t = text || '';
+  while (t.length > MAX) {
+    const cut = t.lastIndexOf('\n', MAX) > 0 ? t.lastIndexOf('\n', MAX) : MAX;
+    const part = t.slice(0, cut);
+    await fetch(`${API}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: part })
+    });
+    t = t.slice(cut);
+  }
+  await fetch(`${API}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text: t })
   });
+}
+
+// 最近一次貼的「素材」暫存（每個 chat 各自獨立）
+const lastUserText = {};
+const RESERVED = new Set([
+  '🧭 戀股主場｜盤前導航 × 操作建議',
+  '🧭 戀股主場｜盤前導航 × 操作分析',
+  '📰 午盤小結',
+  '📈 盤後對帳',
+  '💲 查價',
+  '🧹 收起選單',
+  '🔮 預覽盤前',
+  '✅ 發布盤前',
+  '/menu', '/start', '/today', '/noon', '/close'
+]);
+
+function ymdLocal() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2,'0');
+  const da = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${da}`;
+}
+
+app.get('/healthz', (req, res) => {
+  res.status(200).json({ ok: true, version: VERSION, time: new Date().toString() });
 });
 
 // Telegram Webhook entry
@@ -53,60 +93,116 @@ app.post('/tg', async (req, res) => {
     const chatId = msg.chat.id;
     const text = (msg.text || '').trim();
 
-    // 顯示底部功能列
+    // 記住非指令且非功能鍵的「素材」
+    if (text && !text.startsWith('/') && !RESERVED.has(text)) {
+      lastUserText[chatId] = text;
+    }
+
+    // 主選單
     if (text === '/start' || text === '/menu' || text === '主選單') {
       await sendMenu(chatId);
       return res.sendStatus(200);
     }
 
-    // 盤前導航按鈕觸發（新舊名稱皆支援，× 或 x 都可）
+    // 盤前按鈕（新舊名稱都支援，× 或 x 皆可）
     const isPreopenBtn =
       text === '🧭 戀股主場｜盤前導航 × 操作建議' ||
-      text === '🧭 戀股主場｜盤前導航 × 操作分析' || // 舊名相容
+      text === '🧭 戀股主場｜盤前導航 × 操作分析' ||
       text === '🧭 戀股主場｜盤前導航 x 操作建議';
 
-    let reply = 'I am alive ✅';
-
-    if (text === '/ping') reply = 'pong';
-
-    if (isPreopenBtn) {
-      const f = await preOpen();      // 戀股主場版：盤前預言 + 導航
-      await saveForecast(f);          // 存給盤後對帳
-      reply = f;
+    // /ping
+    if (text === '/ping') {
+      await sendLong(chatId, 'pong');
+      return res.sendStatus(200);
     }
 
-    // 仍保留 /today 文字指令
+    // 盤前（按鈕）
+    if (isPreopenBtn) {
+      const f = await preOpen();
+      await saveForecast(f);
+      await sendLong(chatId, f);
+      return res.sendStatus(200);
+    }
+
+    // 盤前（/today 也保留）
     if (text === '/today') {
       const f = await preOpen();
       await saveForecast(f);
-      reply = f;
+      await sendLong(chatId, f);
+      return res.sendStatus(200);
     }
 
-    // 午盤/盤後（按鈕或斜線指令皆可）
+    // 🔮 預覽盤前
+    if (text === '🔮 預覽盤前' || text === '預覽盤前') {
+      const raw = (msg.reply_to_message?.text) || lastUserText[chatId] || '';
+      const preview = makePreopenFromRaw(raw || '（尚未擷取到素材）');
+      await sendLong(chatId, preview);
+      return res.sendStatus(200);
+    }
+
+    // ✅ 發布盤前（支援：直接＋回覆＋冒號內文）
+    if (text === '✅ 發布盤前' || text.startsWith('發布盤前') || text === '發布盤前') {
+      let raw = '';
+      // 直接法：發布盤前：<素材>
+      if (/^發布盤前[:：]/.test(text)) {
+        raw = text.split(/[:：]/)[1]?.trim() || '';
+      }
+      // 回覆法：回覆某則素材訊息再傳「發布盤前」
+      if (!raw && msg.reply_to_message?.text) raw = msg.reply_to_message.text;
+      // 最近貼的素材
+      if (!raw) raw = lastUserText[chatId] || '';
+
+      if (!raw) {
+        await sendLong(chatId, '找不到素材 📄\n請先貼素材，或回覆素材訊息再傳：發布盤前');
+        return res.sendStatus(200);
+      }
+
+      const preopen = makePreopenFromRaw(raw);
+      const ymd = ymdLocal();
+
+      try {
+        // 三份保存：原稿、成品存檔、最新
+        await publishToGitHub(`content/raw/${ymd}.txt`, raw);
+        await publishToGitHub(`content/archive/preopen/${ymd}.txt`, preopen);
+        await publishToGitHub('content/preopen.txt', preopen);
+
+        // 存一份給盤後對帳
+        try { await saveForecast(preopen); } catch {}
+
+        await sendLong(chatId, '已發布並完成歸檔 ✅ 明早 07:20 會自動推播');
+        await sendLong(chatId, preopen); // 同場預覽成品
+        return res.sendStatus(200);
+      } catch (e) {
+        await sendLong(chatId, `發布失敗，請檢查 GITHUB_TOKEN / GH_OWNER / GH_REPO 設定。\n${e.message || e}`);
+        return res.sendStatus(200);
+      }
+    }
+
+    // 午盤
     if (text === '📰 午盤小結' || text === '/noon') {
-      reply = await noonBrief();
+      const m = await noonBrief();
+      await sendLong(chatId, m);
+      return res.sendStatus(200);
     }
 
+    // 盤後對帳
     if (text === '📈 盤後對帳' || text === '/close') {
-      const summary = await closeWrap();            // 收盤總結
-      reply = await compareWithClose(summary);      // 對帳結果
+      const summary = await closeWrap();
+      const report = await compareWithClose(summary);
+      await sendLong(chatId, report);
+      return res.sendStatus(200);
     }
 
-    // 查價：按鈕提示 or 斜線查價
+    // 查價提示 & /p 真查價
     if (text === '💲 查價') {
-      reply = '請輸入：/p 代號（例：/p 2330）';
+      await sendLong(chatId, '請輸入：/p 代號（例：/p 2330）');
+      return res.sendStatus(200);
     }
     if (text.startsWith('/p ')) {
       const q = text.slice(3).trim();
-      reply = await priceLookup(q);
-    }
-
-    // 預覽/發布盤前（若尚未安裝一鍵發布，先回提示）
-    if (text === '🔮 預覽盤前') {
-      reply = '預覽功能尚未安裝（之後可加：把你貼的素材自動排版預覽）。';
-    }
-    if (text === '✅ 發布盤前') {
-      reply = '發布功能尚未安裝（之後可加：自動寫入 content/preopen.txt）。';
+      const ans = await priceLookup(q);
+      await sendLong(chatId, ans);
+      return res.sendStatus(200);
     }
 
     // 收起功能列
@@ -123,13 +219,8 @@ app.post('/tg', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // 統一送出回覆
-    await fetch(`${API}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: reply })
-    });
-
+    // 預設回覆（看得到代表沒匹配到任何指令）
+    await sendLong(chatId, 'I am alive ✅');
     res.sendStatus(200);
   } catch (e) {
     console.error('handler error:', e);
