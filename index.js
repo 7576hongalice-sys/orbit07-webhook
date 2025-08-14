@@ -1,3 +1,5 @@
+process.env.TZ = 'Asia/Taipei'; // 強制使用台灣時區
+
 import express from 'express';
 import fetch from 'node-fetch';
 import { preOpen, noonBrief, closeWrap } from './modules/push.js';
