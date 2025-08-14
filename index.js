@@ -15,6 +15,25 @@ const API = `https://api.telegram.org/bot${TOKEN}`;
 
 const VERSION = '2025-08-14-01';
 
+// ⬇️ 新增：送出底部「戀股主場」功能列
+async function sendMenu(chatId) {
+  const keyboard = [
+    [{ text: '🧭 戀股主場｜盤前導航 × 操作建議' }],
+    [{ text: '🔮 預覽盤前' }, { text: '✅ 發布盤前' }],
+    [{ text: '📰 午盤小結' }, { text: '📈 盤後對帳' }],
+    [{ text: '💲 查價' }, { text: '🧹 收起選單' }]
+  ];
+  await fetch(`${API}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: '〔戀股主場 · 主選單〕請選擇功能：',
+      reply_markup: { keyboard, resize_keyboard: true }
+    })
+  });
+}
+
 app.get('/healthz', (req, res) => {
   res.status(200).json({ 
     ok: true, 
