@@ -16,9 +16,9 @@ const TOKEN = process.env.TG_BOT_TOKEN;
 if (!TOKEN) console.warn('[WARN] TG_BOT_TOKEN is missing');
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
-const VERSION = '2025-08-15-04'; // 改一下版本便於 /healthz 檢查
+const VERSION = '2025-08-15-05'; // 便於 /healthz 檢查
 
-// ———————————————————————— 小工具 ————————————————————————
+// ——— 小工具 ———
 const norm = (s='') => s
   .replace(/\uFF5C/g, '|')  // 全形｜ → 半形|
   .replace(/×/g, 'x')       // 乘號× → x
@@ -63,7 +63,7 @@ const RESERVED_RAW = [
 ];
 const RESERVED = new Set(RESERVED_RAW.map(norm));
 
-// ———————————————————————— 主選單 ————————————————————————
+// ——— 主選單 ———
 async function sendMenu(chatId) {
   const keyboard = [
     [{ text: '🧭 戀股主場｜盤前導航 × 操作建議' }],
@@ -82,16 +82,20 @@ async function sendMenu(chatId) {
   });
 }
 
-// ———————————————————————— 健康檢查 ————————————————————————
+// ——— 健康檢查 ———
 app.get('/healthz', (req, res) => {
   res.status(200).json({ ok: true, version: VERSION, time: new Date().toString() });
 });
 
-// ———————————————————————— Telegram Webhook ————————————————————————
+// ——— Telegram Webhook ———
 app.post('/tg', async (req, res) => {
   try {
     const upd = req.body;
-    const msg = upd.message || upd.edited_message;
+
+    // 👇 新增：忽略 edited_message（例如含網址的訊息被 Telegram 重新編輯）
+    if (upd.edited_message) return res.sendStatus(200);
+
+    const msg = upd.message;
     if (!msg) return res.sendStatus(200);
 
     const chatId = msg.chat.id;
@@ -227,6 +231,6 @@ app.post('/tg', async (req, res) => {
   }
 });
 
-// ———————————————————————— 啟動 ————————————————————————
+// ——— 啟動 ———
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('server up on', PORT));
