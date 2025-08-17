@@ -1,19 +1,25 @@
 name: ORBIT07 - Noon (13:00 TPE)
 
+permissions: {}
+concurrency:
+  group: noon-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   schedule:
-    - cron: '0 5 * * 1-5'     # UTC 05:00 = TPE 13:00
+    - cron: '0 5 * * 1-5'     # UTC 05:00 = TPE 13:00 (Mon-Fri)
   workflow_dispatch: {}
 
 jobs:
   call:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: POST /cron/noon
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_KEY:  ${{ secrets.CRON_KEY }}
         run: |
           set -e
           curl -fsS --retry 3 --retry-delay 5 --max-time 25 \
             -X POST "$BASE_URL/cron/noon?key=$CRON_KEY"
-        env:
-          BASE_URL: ${{ secrets.BASE_URL }}
-          CRON_KEY:  ${{ secrets.CRON_KEY }}
