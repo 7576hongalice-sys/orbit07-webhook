@@ -1,19 +1,25 @@
-name: ORBIT07 - Morning (07:20 TPE)
+name: ORBIT07 - Morning (07:30 TPE)
+
+permissions: {}
+concurrency:
+  group: morning-${{ github.ref }}
+  cancel-in-progress: true
 
 on:
   schedule:
-    - cron: '20 23 * * 1-5'   # UTC 23:20 = TPE 07:20（週一到週五）
+    - cron: '30 23 * * 0-4'   # UTC 23:30 (Sun-Thu) = TPE 07:30 (Mon-Fri)
   workflow_dispatch: {}
 
 jobs:
   call:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: POST /cron/morning
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_KEY:  ${{ secrets.CRON_KEY }}
         run: |
           set -e
           curl -fsS --retry 3 --retry-delay 5 --max-time 25 \
             -X POST "$BASE_URL/cron/morning?key=$CRON_KEY"
-        env:
-          BASE_URL: ${{ secrets.BASE_URL }}
-          CRON_KEY:  ${{ secrets.CRON_KEY }}
