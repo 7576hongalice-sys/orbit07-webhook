@@ -1,0 +1,19 @@
+name: ORBIT07 - Close (16:30 TPE)
+
+on:
+  schedule:
+    - cron: '30 8 * * 1-5'    # UTC 08:30 = TPE 16:30
+  workflow_dispatch: {}
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /cron/close
+        run: |
+          set -e
+          curl -fsS --retry 3 --retry-delay 5 --max-time 25 \
+            -X POST "$BASE_URL/cron/close?key=$CRON_KEY"
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_KEY:  ${{ secrets.CRON_KEY }}
