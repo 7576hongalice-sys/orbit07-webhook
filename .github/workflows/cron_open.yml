@@ -1,23 +1,18 @@
-# .github/workflows/cron_open.yml（臨時測試版）
 name: ORBIT07 - Open (08:55 TPE)
-
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '55 0 * * 1-5'
-
+  schedule: [ { cron: '55 0 * * 1-5' } ]   # UTC 00:55 = TPE 08:55
+  workflow_dispatch: {}
 jobs:
   call:
     runs-on: ubuntu-latest
     steps:
-      - name: POST /cron/ping
-        run: |
-          set -e
-          echo "Hit: $BASE_URL/cron/ping?key=$CRON_KEY"
-          curl -fsS --retry 3 --retry-delay 5 --max-time 25 \
-            -H "Content-Type: application/json" \
-            -X POST "$BASE_URL/cron/ping?key=$CRON_KEY" \
-            -d '{"msg":"from GitHub Actions /cron/ping OK"}'
+      - name: POST /cron/open
         env:
           BASE_URL: ${{ secrets.BASE_URL }}
           CRON_KEY:  ${{ secrets.CRON_KEY }}
+        run: |
+          set -e
+          BASE="${BASE_URL%/}"
+          curl -fsS --retry 3 --retry-delay 5 --max-time 25 \
+            -H "Content-Type: application/json" \
+            -X POST "$BASE/cron/open?key=$CRON_KEY" -d '{}'
