@@ -1,0 +1,30 @@
+name: test-webhook
+on:
+  workflow_dispatch:
+    inputs:
+      path:
+        description: 'endpoint (cron/ping 或 broadcast)'
+        default: 'cron/ping'
+      body:
+        description: 'JSON body'
+        default: '{"msg":"hello from Actions"}'
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call webhook
+        env:
+          BASE_URL: ${{ vars.BASE_URL }}          # 例如 https://orbit07-webhook.onrender.com
+          CRON_KEY: ${{ secrets.CRON_KEY }}       # 要跟伺服器上的 CRON_KEY 一樣
+          PATH:     ${{ github.event.inputs.path }}
+          BODY:     ${{ github.event.inputs.body }}
+        run: |
+          set -e
+          echo "POST $BASE_URL/$PATH"
+          curl -sS -X POST "$BASE_URL/$PATH?key=$CRON_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" | tee response.json
+          echo ""
+          echo "=== Response ==="
+          cat response.json
