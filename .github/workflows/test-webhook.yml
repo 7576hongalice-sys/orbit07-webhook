@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       path:
-        description: 'endpoint (cron/ping 或 broadcast)'
+        description: 'endpoint'
         default: 'cron/ping'
       body:
         description: 'JSON body'
@@ -13,18 +13,36 @@ jobs:
   call:
     runs-on: ubuntu-latest
     steps:
+      - name: Show variables (BASE_URL only)
+        env:
+          BASE_URL: ${{ vars.BASE_URL }}
+        run: |
+          echo "BASE_URL=$BASE_URL"
+          if [ -z "$BASE_URL" ]; then
+            echo "❌ BASE_URL 沒有設定（Repo → Settings → Secrets and variables → Actions → Variables）" && exit 1
+          fi
+
+      - name: Health check
+        env:
+          BASE_URL: ${{ vars.BASE_URL }}
+        run: |
+          echo "GET $BASE_URL/health"
+          curl -sS -i "$BASE_URL/health" | sed -n '1,40p'
+
       - name: Call webhook
         env:
-          BASE_URL: ${{ vars.BASE_URL }}          # 例如 https://orbit07-webhook.onrender.com
-          CRON_KEY: ${{ secrets.CRON_KEY }}       # 要跟伺服器上的 CRON_KEY 一樣
+          BASE_URL: ${{ vars.BASE_URL }}
+          CRON_KEY: ${{ secrets.CRON_KEY }}
           PATH:     ${{ github.event.inputs.path }}
           BODY:     ${{ github.event.inputs.body }}
         run: |
-          set -e
+          if [ -z "$CRON_KEY" ]; then
+            echo "❌ CRON_KEY 沒有設定（Repo → Settings → Secrets and variables → Actions → Secrets）" && exit 1
+          fi
           echo "POST $BASE_URL/$PATH"
-          curl -sS -X POST "$BASE_URL/$PATH?key=$CRON_KEY" \
+          http_code=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "$BASE_URL/$PATH?key=$CRON_KEY" \
             -H "Content-Type: application/json" \
-            -d "$BODY" | tee response.json
-          echo ""
-          echo "=== Response ==="
-          cat response.json
+            -d "$BODY")
+          echo "HTTP $http_code"; echo "=== Response ==="; cat response.json
+          test "$http_code" -lt 400
