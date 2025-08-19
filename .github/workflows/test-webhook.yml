@@ -2,9 +2,9 @@ name: test-webhook
 on:
   workflow_dispatch:
     inputs:
-      path:
+      endpoint:                # ← 和畫面上的欄位一致
         description: 'endpoint'
-        default: 'cron/ping'
+        default: 'cron/ping'   # 先測 ping
       body:
         description: 'JSON body'
         default: '{"msg":"hello from Actions"}'
@@ -33,15 +33,15 @@ jobs:
         env:
           BASE_URL: ${{ vars.BASE_URL }}
           CRON_KEY: ${{ secrets.CRON_KEY }}
-          PATH:     ${{ github.event.inputs.path }}
+          ENDPOINT: ${{ github.event.inputs.endpoint }}   # ← 改這裡
           BODY:     ${{ github.event.inputs.body }}
         run: |
           if [ -z "$CRON_KEY" ]; then
             echo "❌ CRON_KEY 沒有設定（Repo → Settings → Secrets and variables → Actions → Secrets）" && exit 1
           fi
-          echo "POST $BASE_URL/$PATH"
+          echo "POST $BASE_URL/$ENDPOINT"
           http_code=$(curl -sS -o response.json -w "%{http_code}" \
-            -X POST "$BASE_URL/$PATH?key=$CRON_KEY" \
+            -X POST "$BASE_URL/$ENDPOINT?key=$CRON_KEY" \
             -H "Content-Type: application/json" \
             -d "$BODY")
           echo "HTTP $http_code"; echo "=== Response ==="; cat response.json
