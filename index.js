@@ -1,8 +1,12 @@
-// === index.js（精簡可用版；支援 /cron/* 與 /broadcast）===
+// === index.js（精簡可用版；支援 /cron/* 與 /broadcast，含「今日頭條」）===
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
 const path = require("path");
+
+// ⬇️ 新增：RSS 解析器（抓當天路透頭條）
+const Parser = require('rss-parser');
+const parser = new Parser();
 
 const PORT       = process.env.PORT || 3000;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
@@ -23,6 +27,24 @@ async function readTemplate(name){
   const p = path.join(__dirname,"content",`${name}.txt`);
   try { const t = (await fs.readFile(p,"utf8")||"").trim(); return t||`(${name} 尚無內容)`; }
   catch { return `(${name} 模板讀取失敗或不存在)`; }
+}
+
+// ⬇️ 新增：抓當天最新頭條（免費 RSS）
+async function fetchSnapshot() {
+  const feeds = [
+    'https://feeds.reuters.com/reuters/marketsNews',
+    'https://feeds.reuters.com/reuters/worldNews',
+    'https://feeds.reuters.com/reuters/businessNews',
+    'https://feeds.reuters.com/reuters/technologyNews',
+  ];
+  const items = [];
+  for (const url of feeds) {
+    try {
+      const d = await parser.parseURL(url);
+      items.push(...(d.items || []).slice(0, 3).map(e => `- ${e.title}`));
+    } catch (_) {}
+  }
+  return items.slice(0, 10).join('\n') || '- （暫無頭條）';
 }
 
 async function sendTG(text, chatId, mode){
@@ -53,8 +75,17 @@ app.post("/broadcast", async (req,res)=>{
 async function compose(mode){
   const header = { morning:"🧭 戀股主場｜盤前導航", open:"🚀 戀股主場｜開盤提醒", noon:"⏱️ 戀股主場｜午盤小結", close:"📊 戀股主場｜收盤小結" }[mode] || "📮 推播";
   const tpl    = { morning:"preopen", open:"preopen", noon:"noon", close:"close" }[mode] || "preopen";
-  const body = await readTemplate(tpl);
+
+  // ⬇️ 新增：同時讀模板與抓頭條
+  const [body, shot] = await Promise.all([
+    readTemplate(tpl),
+    fetchSnapshot()
+  ]);
+
   return `${header}｜${nowStr()}
+——
+今日頭條
+${shot}
 
 ${body}
 
