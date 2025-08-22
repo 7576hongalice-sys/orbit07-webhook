@@ -1,8 +1,9 @@
-// === index.js（cron/broadcast + Telegram /webhook 查價 + Markdown回退）===
+// === index.js（cron/broadcast + Telegram /webhook 查價 + 07:40 兩段推播）===
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
 const path = require("path");
+const { randomUUID } = require("crypto");
 
 const Parser = require("rss-parser");
 const parser = new Parser();
@@ -10,7 +11,7 @@ const parser = new Parser();
 // ---- ENV ----
 const PORT         = process.env.PORT || 3000;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;          // 必填：你的 Telegram Bot Token
-const CHAT_ID      = process.env.CHAT_ID;               // /broadcast 預設 chat_id（可空）
+const CHAT_ID      = process.env.CHAT_ID;               // 你的私人視窗或推播預設對象
 const CRON_KEY     = process.env.CRON_KEY || "";        // /cron/* 與 /broadcast 驗證用
 const TZ           = process.env.TZ || "Asia/Taipei";
 const PARSE_MODE   = process.env.PARSE_MODE || "Markdown";
@@ -19,20 +20,21 @@ const SYMBOLS_PATH = process.env.SYMBOLS_PATH || "./symbols.json"; // 全市場�
 if (!TG_BOT_TOKEN) console.warn("⚠️  TG_BOT_TOKEN 未設定，將無法推播/回覆");
 if (!CHAT_ID)      console.warn("⚠️  CHAT_ID 未設定，/broadcast 需要 body.chat_id 或自行指定");
 
-// ---- 基本 HTTP 伺服器 ----
 const app = express();
 app.use(express.json());
 
+// ====== 共用小工具 ======
 function nowStr(){ return new Date().toLocaleString("zh-TW",{ timeZone: TZ }); }
+function todayDateStr(){ return new Date().toLocaleDateString("zh-TW",{ timeZone: TZ }); }
 
-// ========== 讀取模板 ==========
+// ====== 模板讀取 ======
 async function readTemplate(name){
   const p = path.join(__dirname,"content",`${name}.txt`);
   try { const t = (await fs.readFile(p,"utf8")||"").trim(); return t||`(${name} 尚無內容)`; }
   catch { return `(${name} 模板讀取失敗或不存在)`; }
 }
 
-// ========== 今日頭條（路透RSS） ==========
+// ====== 今日頭條（路透RSS） ======
 async function fetchSnapshot() {
   const feeds = [
     "https://feeds.reuters.com/reuters/marketsNews",
@@ -50,7 +52,7 @@ async function fetchSnapshot() {
   return items.slice(0, 10).join("\n") || "- （暫無頭條）";
 }
 
-// ========== Telegram 發送（Markdown → 失敗回退純文字） ==========
+// ====== TG 發送（Markdown → 失敗回退純文字） ======
 async function sendTG(text, chatId, mode){
   if (!TG_BOT_TOKEN) throw new Error("TG_BOT_TOKEN not set");
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
@@ -64,10 +66,10 @@ async function sendTG(text, chatId, mode){
   }
 }
 
-// ========== 金鑰驗證（cron/broadcast 用） ==========
+// ====== 金鑰驗證（cron/broadcast 用） ======
 function verifyKey(req,res){
   const key = req.headers["x-webhook-key"] || req.query.key || "";
-  if (!CRON_KEY) return true; // 沒設就不驗
+  if (!CRON_KEY) return true;
   if (key !== CRON_KEY){ res.status(401).json({ok:false,error:"bad key"}); return false; }
   return true;
 }
@@ -75,7 +77,7 @@ function verifyKey(req,res){
 // 健康檢查
 app.get(["/","/health"],(_,res)=>res.send("ok"));
 
-// ========== /broadcast：手動推播 ==========
+// ====== 手動推播（保留） ======
 app.post("/broadcast", async (req,res)=>{
   if(!verifyKey(req,res))return;
   const { text, chat_id, mode } = req.body||{};
@@ -84,7 +86,7 @@ app.post("/broadcast", async (req,res)=>{
   catch(e){ console.error("broadcast error:",e?.response?.data||e.message); res.status(500).json({ ok:false, error:e?.response?.data||e.message }); }
 });
 
-// ========== /cron/* 四個端點 ==========
+// ====== 你原本四個排程的組稿（保留） ======
 async function compose(mode){
   const header = {
     morning:"🧭 戀股主場｜盤前導航",
@@ -124,8 +126,8 @@ app.post("/cron/ping", async (req,res)=>{
   catch(e){ console.error(e?.response?.data||e.message); res.status(500).send("tg error"); }
 });
 
-// ========== 全市場查價：代號/名稱/別名 ==========
-let SYMBOL_MAP = null;      // { code: "台積電", ... } + 反查
+// ====== 全市場查價：代號/名稱/別名（保留） ======
+let SYMBOL_MAP = null;
 let SYMBOL_MTIME = 0;
 
 const BUILTIN_ALIAS = Object.freeze({
@@ -145,6 +147,12 @@ const BUILTIN_ALIAS = Object.freeze({
   "2330":"台積電","台積電":"2330",
   "2317":"鴻海","鴻海":"2317",
   "3715":"定穎投控","定穎投控":"3715",
+  "4958":"臻鼎-KY","臻鼎-KY":"4958",
+  "3230":"錦明","錦明":"3230",
+  "1532":"勤美","勤美":"1532", // 你說「錦明」：若是 1532 勤美，先暫放；之後可在 symbols.json 正名
+  "6274":"台燿","台燿":"6274",
+  "3211":"順達","順達":"3211",
+  "6196":"帆宣","帆宣":"6196",
 });
 
 async function loadSymbolsIfNeeded(){
@@ -153,7 +161,7 @@ async function loadSymbolsIfNeeded(){
     if (!stat) { if (!SYMBOL_MAP) SYMBOL_MAP = {...BUILTIN_ALIAS}; return SYMBOL_MAP; }
     if (!SYMBOL_MAP || stat.mtimeMs !== SYMBOL_MTIME) {
       const raw = await fs.readFile(SYMBOLS_PATH,"utf8").catch(()=> "[]");
-      const arr = JSON.parse(raw); // 期待 [{code:"2330", name:"台積電", alias:["台积电","TSMC"]}, ...]
+      const arr = JSON.parse(raw);
       const map = {...BUILTIN_ALIAS};
       for (const it of arr){
         if (!it || !it.code) continue;
@@ -168,9 +176,7 @@ async function loadSymbolsIfNeeded(){
   }
   return SYMBOL_MAP;
 }
-
 function looksLikeCode(s){ return /^[0-9]{4,5}[A-Z]*$/.test(s.toUpperCase()); }
-
 async function resolveSymbol(q){
   const s = String(q||"").trim();
   if (!s) return null;
@@ -183,7 +189,6 @@ async function resolveSymbol(q){
   if (code) return { code, name: s };
   return null;
 }
-
 async function fetchTWQuote(code){
   const ts = Date.now();
   const urls = [
@@ -214,65 +219,224 @@ async function fetchTWQuote(code){
   return { ok:false };
 }
 
-// ========== Telegram /webhook：/menu + 查價 ==========
+// ====== 07:40 兩階段：組稿 ======
+// 你的清單
+const TRACK_SELF = ["佳能","敬鵬","臻鼎-KY","新纖","力新","富喬","錦明"];
+const TRACK_MOM  = ["台燿","順達","帆宣"];
+
+async function composeMorningPhase1(){
+  const shot = await fetchSnapshot();
+  // 直接照你的版型 + emoji
+  return `${todayDateStr()} 盤前導航 × 總覽
+🌍 國際盤與新聞重點
+${shot || "（稍後補充）"}
+
+🏦 三大法人買賣超排行（${todayDateStr()} 前一交易日）
+・外資：— 
+・投信：—
+・自營商：—
+
+🧪 戀股主場 × 五大模組共振分析
+・林睿閎：—
+・吳岳展：—
+・游庭皓：—
+
+🧭 操作建議導航
+（待補）
+
+⚠️ 開盤注意事項
+（待補）`;
+}
+
+async function stockLine(nameOrCode){
+  const hit = await resolveSymbol(nameOrCode);
+  if (!hit) return `• ${nameOrCode}｜VWAP：—｜關鍵價：—｜操作/風控：—\n  四價：開— 高— 低— 收—`;
+  const r = await fetchTWQuote(hit.code);
+  const k = `• ${hit.code} ${hit.name || nameOrCode}｜VWAP：—｜關鍵價：—｜操作/風控：—`;
+  if (!r.ok) return `${k}\n  四價：開— 高— 低— 收—`;
+  return `${k}\n  四價：開${r.open} 高${r.high} 低${r.low} 收${r.close}`;
+}
+async function composeMorningPhase2(){
+  const linesSelf = await Promise.all(TRACK_SELF.map(stockLine));
+  const linesMom  = await Promise.all(TRACK_MOM.map(stockLine));
+  return `個股預言 × 四價表（${todayDateStr()}）
+📌 你的追蹤股
+${linesSelf.join("\n")}
+
+💡 媽媽追蹤股（必分析）
+${linesMom.join("\n")}
+
+註：VWAP／關鍵價／操作與風控為佔位，等你提供規則或資料源後自動填入。`;
+}
+
+// ====== 07:40 兩階段：端點 ======
+app.post("/cron/morning1", async (req,res)=>{
+  if(!verifyKey(req,res))return;
+  try{
+    const text = await composeMorningPhase1();
+    const r = await sendTG(text);
+    res.json({ ok:true, result:r });
+  }catch(e){
+    console.error("/cron/morning1 error:", e?.response?.data||e.message);
+    res.status(500).json({ ok:false, error:e?.response?.data||e.message });
+  }
+});
+app.post("/cron/morning2", async (req,res)=>{
+  if(!verifyKey(req,res))return;
+  try{
+    const text = await composeMorningPhase2();
+    const r = await sendTG(text);
+    res.json({ ok:true, result:r });
+  }catch(e){
+    console.error("/cron/morning2 error:", e?.response?.data||e.message);
+    res.status(500).json({ ok:false, error:e?.response?.data||e.message });
+  }
+});
+
+// ====== Telegram /webhook：/menu + 查價 ======
+function keyboard(){
+  return {
+    reply_markup:{
+      keyboard: [[{text:"查價"},{text:"清單"},{text:"狀態"}]],
+      resize_keyboard:true,
+      is_persistent:true
+    }
+  };
+}
 async function reply(chatId, text){
   return sendTG(text, chatId, PARSE_MODE).catch(()=>sendTG(text, chatId, null));
 }
+
+// —— 草稿審稿（保留，讓你先審再發）——
+const drafts = new Map();      // id -> { text, target, createdAt }
+const awaitingEdit = new Map();// userId -> draftId
+function previewText(text){
+  const t = (text||"").trim();
+  return "📝 草稿預覽\n——\n" + (t.length>3800 ? t.slice(0,3750)+"\n…（已截斷）" : t);
+}
+function inlineKB(id){
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text:"✅ 發佈", callback_data:`pub:${id}` },
+         { text:"✏️ 我來改", callback_data:`edit:${id}` }],
+        [{ text:"🧹 壓縮", callback_data:`tight:${id}` },
+         { text:"🗑️ 丟棄", callback_data:`drop:${id}` }]
+      ]
+    }
+  };
+}
+function tighten(text=""){
+  return (text||"")
+    .replace(/[ \t]+/g," ")
+    .replace(/\n{3,}/g,"\n\n")
+    .replace(/[—–-]{3,}/g,"—")
+    .replace(/([🔥⭐️✨⬆️⬇️🚀📉📈])\1{2,}/g,"$1$1")
+    .trim();
+}
+app.post("/draft", async (req,res)=>{
+  if(!verifyKey(req,res)) return;
+  try{
+    const { text, target } = req.body || {};
+    if(!text) return res.status(400).json({ ok:false, error:"text required" });
+    const id = randomUUID();
+    drafts.set(id, { text, target:(target==="me"?"me":"group"), createdAt: Date.now() });
+    await sendTG(previewText(text), CHAT_ID, PARSE_MODE);
+    await sendTG(`草稿ID：\`${id}\``, CHAT_ID, "Markdown");
+    await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+      chat_id: CHAT_ID, text:"請選擇：", ...inlineKB(id)
+    });
+    res.json({ ok:true, id });
+  }catch(e){
+    console.error("draft error:", e?.response?.data||e.message);
+    res.status(500).json({ ok:false, error: e?.response?.data||e.message });
+  }
+});
 
 app.post("/webhook", async (req,res)=>{
   res.sendStatus(200);
   try{
     const up = req.body || {};
+
+    if (up.callback_query) {
+      const cq = up.callback_query;
+      const fromId = cq.from?.id;
+      const data = String(cq.data||"");
+      const m = data.match(/^(pub|edit|tight|drop):(.+)$/);
+      if (!m) return;
+      const [, act, id] = m;
+      const d = drafts.get(id);
+      if (!d) { await sendTG("❌ 這份草稿已不存在。", CHAT_ID, null); return; }
+      if (act === "drop") { drafts.delete(id); awaitingEdit.delete(fromId); await sendTG("🗑️ 已丟棄草稿。", CHAT_ID, null); return; }
+      if (act === "tight"){ d.text = tighten(d.text); drafts.set(id,d); await sendTG(previewText(d.text), CHAT_ID, PARSE_MODE);
+        await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, { chat_id: CHAT_ID, text:"已壓縮，繼續選：", ...inlineKB(id) }); return; }
+      if (act === "edit") { awaitingEdit.set(fromId, id); await sendTG("請直接回覆一段新文案（單條訊息）。", CHAT_ID, null); return; }
+      if (act === "pub")  { await sendTG(d.text, CHAT_ID, PARSE_MODE); drafts.delete(id); awaitingEdit.delete(fromId); await sendTG("✅ 已發佈。", CHAT_ID, null); return; }
+      return;
+    }
+
     const msg = up.message || up.edited_message || up.channel_post || up.edited_channel_post;
     if (!msg?.chat?.id) return;
-
     const chatId = msg.chat.id;
     const text = (msg.caption || msg.text || "").trim();
 
-    // /menu or /start
+    const waitingId = awaitingEdit.get(msg.from?.id);
+    if (waitingId && text) {
+      const d = drafts.get(waitingId);
+      if (d) {
+        d.text = text;
+        drafts.set(waitingId, d);
+        awaitingEdit.delete(msg.from.id);
+        await sendTG("🖊️ 已更新草稿：", CHAT_ID, null);
+        await sendTG(previewText(d.text), CHAT_ID, PARSE_MODE);
+        await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+          chat_id: CHAT_ID, text:"要發佈嗎？", ...inlineKB(waitingId)
+        });
+        return;
+      }
+    }
+
+    // /start /menu
     if (/^\/(start|menu)\b/i.test(text)){
       const s = [
         "✅ 我在！可以直接輸入：",
         "• `查 2330` 或 `股價 台積電`",
         "• `查 佳能`（代號/名稱/別名皆可）",
         "",
-        "排程推播：仍維持 /cron/* 與 /broadcast。",
+        "07:40 兩段推播已啟用：/cron/morning1、/cron/morning2",
       ].join("\n");
       return sendTG(s, chatId, "Markdown");
     }
 
-    // 狀態/清單（保留，暫時簡答）
     if (text === "狀態" || text === "/狀態"){
       const s = `服務：OK
 時間：${nowStr()}
 symbols：${SYMBOLS_PATH}（若不存在則使用內建別名）`;
-      return reply(chatId, s);
+      return sendTG(s, chatId, null);
     }
     if (text === "清單" || text === "/清單"){
-      return reply(chatId, "清單功能之後補強（不影響查價與推播）。");
+      return sendTG("清單功能之後補強（不影響查價與推播）。", chatId, null);
     }
 
-    // 查價：查 2330 / 股價 台積電 / 查 佳能 / 查2618 / 股價台積電（允許無空格）
+    // 查價：查 2330 / 股價 台積電 / 查 佳能
     let q = null;
-    // 🔧 關鍵修正：\s+ -> \s* 允許沒有空格
-    let m1 = text.match(/^\/?(查價|股價|查)\s*(.+)$/);
+    let m1 = text.match(/^\/?(查價|股價|查)\s+(.+)$/);
     if (m1) q = m1[2].trim();
     if (!q && (text === "查價" || text === "/股價")) {
-      return reply(chatId, "請輸入：查 代號或名稱（例：查 2330、股價 台積電、查 佳能）");
+      return sendTG("請輸入：查 代號或名稱（例：查 2330、股價 台積電、查 佳能）", chatId, null);
     }
     if (q){
       const hit = await resolveSymbol(q);
-      if (!hit) return reply(chatId, `查無對應代號/名稱：「${q}」\n可在 ${SYMBOLS_PATH} 加入別名，或用代號再試試。`);
+      if (!hit) return sendTG(`查無對應代號/名稱：「${q}」\n可在 ${SYMBOLS_PATH} 加入別名，或用代號再試試。`, chatId, null);
       const r = await fetchTWQuote(hit.code);
-      if (!r.ok) return reply(chatId, `【${hit.code} ${hit.name||""}】暫時取不到即時/日收資料，稍後再試。`);
+      if (!r.ok) return sendTG(`【${hit.code} ${hit.name||""}】暫時取不到即時/日收資料，稍後再試。`, chatId, null);
       const line =
-`【${hit.code} ${hit.name || r.name}｜${r.market}】 ${r.date} 收：**${r.close}**
+`【${hit.code} ${hit.name || r.name}｜${r.market}】 ${r.date} 收：*${r.close}*
 (開:${r.open} 高:${r.high} 低:${r.low})`;
       return sendTG(line, chatId, "Markdown");
     }
 
-    // 其他訊息：簡短回覆
-    if (text) await reply(chatId, `收到：「${text}」`);
+    if (text) await sendTG(`收到：「${text}」`, chatId, null);
   }catch(e){
     console.error("/webhook error:", e?.response?.data||e.message);
   }
