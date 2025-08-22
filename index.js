@@ -175,6 +175,7 @@ const BUILTIN_ALIAS = Object.freeze({
   "6274":"台燿","台燿":"6274",
   "3211":"順達","順達":"3211",
   "6196":"帆宣","帆宣":"6196",
+  "1409":"新纖","新纖":"1409",
 });
 
 async function loadSymbolsIfNeeded(){
