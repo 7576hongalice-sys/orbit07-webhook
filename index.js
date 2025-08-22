@@ -25,7 +25,7 @@ app.use(express.json());
 
 function nowStr(){ return new Date().toLocaleString("zh-TW",{ timeZone: TZ }); }
 
-// ========== 讀取模板（你原本的） ==========
+// ========== 讀取模板 ==========
 async function readTemplate(name){
   const p = path.join(__dirname,"content",`${name}.txt`);
   try { const t = (await fs.readFile(p,"utf8")||"").trim(); return t||`(${name} 尚無內容)`; }
@@ -84,7 +84,7 @@ app.post("/broadcast", async (req,res)=>{
   catch(e){ console.error("broadcast error:",e?.response?.data||e.message); res.status(500).json({ ok:false, error:e?.response?.data||e.message }); }
 });
 
-// ========== /cron/* 四個端點（你原本的） ==========
+// ========== /cron/* 四個端點 ==========
 async function compose(mode){
   const header = {
     morning:"🧭 戀股主場｜盤前導航",
@@ -215,16 +215,6 @@ async function fetchTWQuote(code){
 }
 
 // ========== Telegram /webhook：/menu + 查價 ==========
-function keyboard(){
-  return {
-    reply_markup:{
-      keyboard: [[{text:"查價"},{text:"清單"},{text:"狀態"}]],
-      resize_keyboard:true,
-      is_persistent:true
-    }
-  };
-}
-
 async function reply(chatId, text){
   return sendTG(text, chatId, PARSE_MODE).catch(()=>sendTG(text, chatId, null));
 }
@@ -262,9 +252,10 @@ symbols：${SYMBOLS_PATH}（若不存在則使用內建別名）`;
       return reply(chatId, "清單功能之後補強（不影響查價與推播）。");
     }
 
-    // 查價：查 2330 / 股價 台積電 / 查 佳能
+    // 查價：查 2330 / 股價 台積電 / 查 佳能 / 查2618 / 股價台積電（允許無空格）
     let q = null;
-    let m1 = text.match(/^\/?(查價|股價|查)\s+(.+)$/);
+    // 🔧 關鍵修正：\s+ -> \s* 允許沒有空格
+    let m1 = text.match(/^\/?(查價|股價|查)\s*(.+)$/);
     if (m1) q = m1[2].trim();
     if (!q && (text === "查價" || text === "/股價")) {
       return reply(chatId, "請輸入：查 代號或名稱（例：查 2330、股價 台積電、查 佳能）");
