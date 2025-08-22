@@ -1,4 +1,4 @@
-// === index.js（cron/broadcast + Telegram /webhook 查價 + 07:40 兩段推播）===
+// === index.js（cron/broadcast + Telegram /webhook 查價 + 07:40 兩段推播 + 發布到群）===
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
@@ -17,8 +17,14 @@ const TZ           = process.env.TZ || "Asia/Taipei";
 const PARSE_MODE   = process.env.PARSE_MODE || "Markdown";
 const SYMBOLS_PATH = process.env.SYMBOLS_PATH || "./symbols.json"; // 全市場別名（可選）
 
+// >>> 新增：主人與群組 <<<
+const OWNER_ID       = Number(process.env.OWNER_ID || 8418229161);     // 你的 TG user id
+const GROUP_CHAT_ID  = process.env.GROUP_CHAT_ID || "-4906365799";     // 你的群組 chat_id（負號開頭）
+
 if (!TG_BOT_TOKEN) console.warn("⚠️  TG_BOT_TOKEN 未設定，將無法推播/回覆");
 if (!CHAT_ID)      console.warn("⚠️  CHAT_ID 未設定，/broadcast 需要 body.chat_id 或自行指定");
+if (!OWNER_ID)     console.warn("⚠️  OWNER_ID 未設定（發布：功能將無法限制）");
+if (!GROUP_CHAT_ID)console.warn("⚠️  GROUP_CHAT_ID 未設定（發布到群組會失敗）");
 
 const app = express();
 app.use(express.json());
@@ -225,7 +231,6 @@ const TRACK_MOM  = ["台燿","順達","帆宣"];
 
 async function composeMorningPhase1(){
   const shot = await fetchSnapshot();
-  // 直接照你的版型 + emoji
   return `${todayDateStr()} 盤前導航 × 總覽
 🌍 國際盤與新聞重點
 ${shot || "（稍後補充）"}
@@ -292,7 +297,7 @@ app.post("/cron/morning2", async (req,res)=>{
   }
 });
 
-// ====== Telegram /webhook：/menu + 查價 ======
+// ====== Telegram /webhook：/menu + 查價 + 發布到群 ======
 function keyboard(){
   return {
     reply_markup:{
@@ -306,93 +311,21 @@ async function reply(chatId, text){
   return sendTG(text, chatId, PARSE_MODE).catch(()=>sendTG(text, chatId, null));
 }
 
-// —— 草稿審稿（保留，讓你先審再發）——
-const drafts = new Map();      // id -> { text, target, createdAt }
-const awaitingEdit = new Map();// userId -> draftId
-function previewText(text){
-  const t = (text||"").trim();
-  return "📝 草稿預覽\n——\n" + (t.length>3800 ? t.slice(0,3750)+"\n…（已截斷）" : t);
-}
-function inlineKB(id){
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text:"✅ 發佈", callback_data:`pub:${id}` },
-         { text:"✏️ 我來改", callback_data:`edit:${id}` }],
-        [{ text:"🧹 壓縮", callback_data:`tight:${id}` },
-         { text:"🗑️ 丟棄", callback_data:`drop:${id}` }]
-      ]
-    }
-  };
-}
-function tighten(text=""){
-  return (text||"")
-    .replace(/[ \t]+/g," ")
-    .replace(/\n{3,}/g,"\n\n")
-    .replace(/[—–-]{3,}/g,"—")
-    .replace(/([🔥⭐️✨⬆️⬇️🚀📉📈])\1{2,}/g,"$1$1")
-    .trim();
-}
-app.post("/draft", async (req,res)=>{
-  if(!verifyKey(req,res)) return;
-  try{
-    const { text, target } = req.body || {};
-    if(!text) return res.status(400).json({ ok:false, error:"text required" });
-    const id = randomUUID();
-    drafts.set(id, { text, target:(target==="me"?"me":"group"), createdAt: Date.now() });
-    await sendTG(previewText(text), CHAT_ID, PARSE_MODE);
-    await sendTG(`草稿ID：\`${id}\``, CHAT_ID, "Markdown");
-    await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-      chat_id: CHAT_ID, text:"請選擇：", ...inlineKB(id)
-    });
-    res.json({ ok:true, id });
-  }catch(e){
-    console.error("draft error:", e?.response?.data||e.message);
-    res.status(500).json({ ok:false, error: e?.response?.data||e.message });
-  }
-});
-
 app.post("/webhook", async (req,res)=>{
   res.sendStatus(200);
   try{
     const up = req.body || {};
-
-    if (up.callback_query) {
-      const cq = up.callback_query;
-      const fromId = cq.from?.id;
-      const data = String(cq.data||"");
-      const m = data.match(/^(pub|edit|tight|drop):(.+)$/);
-      if (!m) return;
-      const [, act, id] = m;
-      const d = drafts.get(id);
-      if (!d) { await sendTG("❌ 這份草稿已不存在。", CHAT_ID, null); return; }
-      if (act === "drop") { drafts.delete(id); awaitingEdit.delete(fromId); await sendTG("🗑️ 已丟棄草稿。", CHAT_ID, null); return; }
-      if (act === "tight"){ d.text = tighten(d.text); drafts.set(id,d); await sendTG(previewText(d.text), CHAT_ID, PARSE_MODE);
-        await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, { chat_id: CHAT_ID, text:"已壓縮，繼續選：", ...inlineKB(id) }); return; }
-      if (act === "edit") { awaitingEdit.set(fromId, id); await sendTG("請直接回覆一段新文案（單條訊息）。", CHAT_ID, null); return; }
-      if (act === "pub")  { await sendTG(d.text, CHAT_ID, PARSE_MODE); drafts.delete(id); awaitingEdit.delete(fromId); await sendTG("✅ 已發佈。", CHAT_ID, null); return; }
-      return;
-    }
-
     const msg = up.message || up.edited_message || up.channel_post || up.edited_channel_post;
     if (!msg?.chat?.id) return;
+
     const chatId = msg.chat.id;
     const text = (msg.caption || msg.text || "").trim();
 
-    const waitingId = awaitingEdit.get(msg.from?.id);
-    if (waitingId && text) {
-      const d = drafts.get(waitingId);
-      if (d) {
-        d.text = text;
-        drafts.set(waitingId, d);
-        awaitingEdit.delete(msg.from.id);
-        await sendTG("🖊️ 已更新草稿：", CHAT_ID, null);
-        await sendTG(previewText(d.text), CHAT_ID, PARSE_MODE);
-        await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-          chat_id: CHAT_ID, text:"要發佈嗎？", ...inlineKB(waitingId)
-        });
-        return;
-      }
+    // >>> 新增：只有 OWNER 可以用「發布：」把內容轉發到群組（Markdown）
+    if (msg.from?.id === OWNER_ID && /^發布[:：]\s*/.test(text) && GROUP_CHAT_ID){
+      const payload = text.replace(/^發布[:：]\s*/,"").trim();
+      if (payload) { await sendTG(payload, GROUP_CHAT_ID, "Markdown"); }
+      return; // 已處理
     }
 
     // /start /menu
@@ -403,6 +336,7 @@ app.post("/webhook", async (req,res)=>{
         "• `查 佳能`（代號/名稱/別名皆可）",
         "",
         "07:40 兩段推播已啟用：/cron/morning1、/cron/morning2",
+        "群組群發口令（限本人）：`發布：<要發到群的全文>`",
       ].join("\n");
       return sendTG(s, chatId, "Markdown");
     }
@@ -410,7 +344,9 @@ app.post("/webhook", async (req,res)=>{
     if (text === "狀態" || text === "/狀態"){
       const s = `服務：OK
 時間：${nowStr()}
-symbols：${SYMBOLS_PATH}（若不存在則使用內建別名）`;
+symbols：${SYMBOLS_PATH}（若不存在則使用內建別名）
+OWNER_ID：${OWNER_ID}
+GROUP_CHAT_ID：${GROUP_CHAT_ID}`;
       return sendTG(s, chatId, null);
     }
     if (text === "清單" || text === "/清單"){
