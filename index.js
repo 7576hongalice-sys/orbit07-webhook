@@ -1,4 +1,4 @@
-// === index.js（cron/broadcast + Telegram /webhook 查價 + 07:40 兩段推播 + 發布到群）===
+// === index.js（cron/broadcast + Telegram /webhook 查價 + 07:40 兩段推播 + 發布到群/我：POST /pub）===
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
@@ -12,18 +12,18 @@ const parser = new Parser();
 const PORT         = process.env.PORT || 3000;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;          // 必填：你的 Telegram Bot Token
 const CHAT_ID      = process.env.CHAT_ID;               // 你的私人視窗或推播預設對象
-const CRON_KEY     = process.env.CRON_KEY || "";        // /cron/* 與 /broadcast 驗證用
+const CRON_KEY     = process.env.CRON_KEY || "";        // /cron/*、/broadcast、/pub 驗證用
 const TZ           = process.env.TZ || "Asia/Taipei";
 const PARSE_MODE   = process.env.PARSE_MODE || "Markdown";
 const SYMBOLS_PATH = process.env.SYMBOLS_PATH || "./symbols.json"; // 全市場別名（可選）
 
-// >>> 新增：主人與群組 <<<
+// 主人與群組
 const OWNER_ID       = Number(process.env.OWNER_ID || 8418229161);     // 你的 TG user id
-const GROUP_CHAT_ID  = process.env.GROUP_CHAT_ID || "-4906365799";     // 你的群組 chat_id（負號開頭）
+const GROUP_CHAT_ID  = process.env.GROUP_CHAT_ID || "-4906365799";     // 群組 chat_id（負號開頭）
 
 if (!TG_BOT_TOKEN) console.warn("⚠️  TG_BOT_TOKEN 未設定，將無法推播/回覆");
 if (!CHAT_ID)      console.warn("⚠️  CHAT_ID 未設定，/broadcast 需要 body.chat_id 或自行指定");
-if (!OWNER_ID)     console.warn("⚠️  OWNER_ID 未設定（發布：功能將無法限制）");
+if (!OWNER_ID)     console.warn("⚠️  OWNER_ID 未設定（發布限制將失效）");
 if (!GROUP_CHAT_ID)console.warn("⚠️  GROUP_CHAT_ID 未設定（發布到群組會失敗）");
 
 const app = express();
@@ -72,7 +72,7 @@ async function sendTG(text, chatId, mode){
   }
 }
 
-// ====== 金鑰驗證（cron/broadcast 用） ======
+// ====== 金鑰驗證（cron/broadcast/pub 用） ======
 function verifyKey(req,res){
   const key = req.headers["x-webhook-key"] || req.query.key || "";
   if (!CRON_KEY) return true;
@@ -90,6 +90,23 @@ app.post("/broadcast", async (req,res)=>{
   if(!text) return res.status(400).json({ ok:false, error:"text required" });
   try{ res.json({ ok:true, result: await sendTG(text, chat_id, mode) }); }
   catch(e){ console.error("broadcast error:",e?.response?.data||e.message); res.status(500).json({ ok:false, error:e?.response?.data||e.message }); }
+});
+
+// ====== 一鍵發布（新增：POST /pub） ======
+// body: { text: "...", target: "group" | "me", mode?: "Markdown" | null }
+app.post("/pub", async (req,res)=>{
+  if(!verifyKey(req,res))return;
+  try{
+    const { text, target = "group", mode } = req.body || {};
+    if (!text) return res.status(400).json({ ok:false, error:"text required" });
+    const chat = (target === "me") ? CHAT_ID : GROUP_CHAT_ID;
+    if (!chat) return res.status(400).json({ ok:false, error:"chat id missing" });
+    const r = await sendTG(text, chat, mode || "Markdown");
+    res.json({ ok:true, result:r, target });
+  }catch(e){
+    console.error("/pub error:", e?.response?.data||e.message);
+    res.status(500).json({ ok:false, error:e?.response?.data||e.message });
+  }
 });
 
 // ====== 你原本四個排程的組稿（保留） ======
@@ -225,7 +242,6 @@ async function fetchTWQuote(code){
 }
 
 // ====== 07:40 兩階段：組稿 ======
-// 你的清單
 const TRACK_SELF = ["佳能","敬鵬","臻鼎-KY","新纖","力新","富喬","錦明"];
 const TRACK_MOM  = ["台燿","順達","帆宣"];
 
@@ -297,7 +313,7 @@ app.post("/cron/morning2", async (req,res)=>{
   }
 });
 
-// ====== Telegram /webhook：/menu + 查價 + 發布到群 ======
+// ====== Telegram /webhook：/menu + 查價 + 發布到群（口令） ======
 function keyboard(){
   return {
     reply_markup:{
@@ -321,11 +337,11 @@ app.post("/webhook", async (req,res)=>{
     const chatId = msg.chat.id;
     const text = (msg.caption || msg.text || "").trim();
 
-    // >>> 新增：只有 OWNER 可以用「發布：」把內容轉發到群組（Markdown）
+    // 只有 OWNER 可用「發布：」把內容轉發到群組（Markdown）
     if (msg.from?.id === OWNER_ID && /^發布[:：]\s*/.test(text) && GROUP_CHAT_ID){
       const payload = text.replace(/^發布[:：]\s*/,"").trim();
       if (payload) { await sendTG(payload, GROUP_CHAT_ID, "Markdown"); }
-      return; // 已處理
+      return;
     }
 
     // /start /menu
@@ -335,7 +351,7 @@ app.post("/webhook", async (req,res)=>{
         "• `查 2330` 或 `股價 台積電`",
         "• `查 佳能`（代號/名稱/別名皆可）",
         "",
-        "07:40 兩段推播已啟用：/cron/morning1、/cron/morning2",
+        "07:40 兩段推播：/cron/morning1、/cron/morning2",
         "群組群發口令（限本人）：`發布：<要發到群的全文>`",
       ].join("\n");
       return sendTG(s, chatId, "Markdown");
