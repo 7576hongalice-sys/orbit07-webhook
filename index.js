@@ -244,7 +244,7 @@ async function fetchTWQuote(code){
 
 // ====== 07:40 兩階段：組稿 ======
 const TRACK_SELF = ["佳能","敬鵬","臻鼎-KY","新纖","力新","富喬","錦明"];
-const TRACK_MOM  = ["台燿","順達","帆宣"];
+const TRACK_MOM  = ["台燿","順達","帆宣","漢科","毅嘉"];
 
 async function composeMorningPhase1(){
   const shot = await fetchSnapshot();
