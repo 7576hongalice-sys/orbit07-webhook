@@ -3,7 +3,6 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
 const path = require("path");
-const { randomUUID } = require("crypto");
 
 const Parser = require("rss-parser");
 const parser = new Parser();
@@ -32,6 +31,11 @@ app.use(express.json());
 // ====== 共用小工具 ======
 function nowStr(){ return new Date().toLocaleString("zh-TW",{ timeZone: TZ }); }
 function todayDateStr(){ return new Date().toLocaleDateString("zh-TW",{ timeZone: TZ }); }
+function isTradingWeekday(){
+  const d = new Date(new Date().toLocaleString("en-US",{ timeZone: TZ }));
+  const wd = d.getDay(); // 0 Sun ... 6 Sat
+  return wd >= 1 && wd <= 5;
+}
 
 // ====== 模板讀取 ======
 async function readTemplate(name){
@@ -142,12 +146,6 @@ for (const mode of ["morning","open","noon","close"]){
     catch(e){ console.error(`/cron/${mode} error:`,e?.response?.data||e.message); res.status(500).json({ ok:false, error:e?.response?.data||e.message }); }
   });
 }
-
-app.post("/cron/ping", async (req,res)=>{
-  if(!verifyKey(req,res))return;
-  try{ await sendTG(`🔔 測試訊息\n${req.body?.msg||"pong"}\n${nowStr()}`); res.send("pong"); }
-  catch(e){ console.error(e?.response?.data||e.message); res.status(500).send("tg error"); }
-});
 
 // ====== 全市場查價：代號/名稱/別名（保留） ======
 let SYMBOL_MAP = null;
@@ -296,20 +294,29 @@ ${linesMom.join("\n")}
 app.post("/cron/morning1", async (req,res)=>{
   if(!verifyKey(req,res))return;
   try{
+    if (!isTradingWeekday()){
+      return res.json({ ok:true, skipped:"weekend" });
+    }
     const text = await composeMorningPhase1();
-    const r = await sendTG(text);
-    res.json({ ok:true, result:r });
+    // ★ 固定發群組（你指定的 -4906365799）
+    const r = await sendTG(text, GROUP_CHAT_ID, "Markdown");
+    res.json({ ok:true, result:r, target: GROUP_CHAT_ID });
   }catch(e){
     console.error("/cron/morning1 error:", e?.response?.data||e.message);
     res.status(500).json({ ok:false, error:e?.response?.data||e.message });
   }
 });
+
 app.post("/cron/morning2", async (req,res)=>{
   if(!verifyKey(req,res))return;
   try{
+    if (!isTradingWeekday()){
+      return res.json({ ok:true, skipped:"weekend" });
+    }
     const text = await composeMorningPhase2();
-    const r = await sendTG(text);
-    res.json({ ok:true, result:r });
+    // 保持原邏輯：送到預設 CHAT_ID（私人），方便你審一眼
+    const r = await sendTG(text, CHAT_ID, "Markdown");
+    res.json({ ok:true, result:r, target: CHAT_ID });
   }catch(e){
     console.error("/cron/morning2 error:", e?.response?.data||e.message);
     res.status(500).json({ ok:false, error:e?.response?.data||e.message });
@@ -317,15 +324,6 @@ app.post("/cron/morning2", async (req,res)=>{
 });
 
 // ====== Telegram /webhook：/menu + 查價（支援直覺輸入） + 發布到群（口令） ======
-function keyboard(){
-  return {
-    reply_markup:{
-      keyboard: [[{text:"查價"},{text:"清單"},{text:"狀態"}]],
-      resize_keyboard:true,
-      is_persistent:true
-    }
-  };
-}
 async function reply(chatId, text){
   return sendTG(text, chatId, PARSE_MODE).catch(()=>sendTG(text, chatId, null));
 }
@@ -355,7 +353,7 @@ app.post("/webhook", async (req,res)=>{
         "• 口語：`台積電多少`、`2330股價`",
         "• 當然也支援：`查 2330`、`股價 台積電`",
         "",
-        "07:40 兩段推播：/cron/morning1、/cron/morning2",
+        "07:40 兩段推播：/cron/morning1（自動發群）／/cron/morning2（先發給我看）",
         "群組群發口令（限本人）：`發布：<要發到群的全文>`",
       ].join("\n");
       return sendTG(s, chatId, "Markdown");
@@ -374,33 +372,26 @@ GROUP_CHAT_ID：${GROUP_CHAT_ID}`;
     }
 
     // === 查價偵測 ===
-    // 支援三種：
-    // 1) 指令式：「查 2330」「股價 台積電」「查 毅嘉」
-    // 2) 直覺式：直接輸入「2402」或「毅嘉」
-    // 3) 口語式：「台積電多少」「2402股價」
     let q = null;
 
     // (A) 指令式
     let m1 = text.match(/^\/?(查價|股價|查)\s+(.+)$/);
     if (m1) q = m1[2].trim();
 
-    // (B) 口語/直覺：去掉標點與常見語尾詞，只保留短字串
+    // (B) 口語/直覺
     if (!q) {
       const cleaned = text
-        .replace(/[，。,\.！？!?～~()\[\]{}【】「」『』：:；;、\s]/g, "")   // 去標點/空白
-        .replace(/(股價|價格|多少|幾元|幾塊|報價)$/u, "");                  // 去語尾詞
-      // 只處理短且像代號/名稱的字串，避免誤觸
+        .replace(/[，。,\.！？!?～~()\[\]{}【】「」『』：:；;、\s]/g, "")
+        .replace(/(股價|價格|多少|幾元|幾塊|報價)$/u, "");
       if (cleaned && cleaned.length <= 12 && /^[\p{L}\p{N}A-Za-z0-9\-]+$/u.test(cleaned)) {
         q = cleaned;
       }
     }
 
-    // 引導用（按了「查價」卻沒輸入標的）
     if (!q && (text === "查價" || text === "/股價")) {
       return sendTG("請直接輸入：`2402`、`毅嘉`、或 `台積電多少`（也可：`查 2330`）", chatId, "Markdown");
     }
 
-    // 真正查價
     if (q){
       const hit = await resolveSymbol(q);
       if (!hit) return sendTG(`查無對應代號/名稱：「${q}」\n可在 ${SYMBOLS_PATH} 加入別名，或用代號再試試。`, chatId, null);
@@ -412,7 +403,6 @@ GROUP_CHAT_ID：${GROUP_CHAT_ID}`;
       return sendTG(line, chatId, "Markdown");
     }
 
-    // 其它文字就回覆已收到（避免沉默）
     if (text) await sendTG(`收到：「${text}」`, chatId, null);
   }catch(e){
     console.error("/webhook error:", e?.response?.data||e.message);
