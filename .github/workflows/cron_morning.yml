@@ -1,22 +1,21 @@
-name: ORBIT07 - Morning (07:30 TPE)
+name: ORBIT07 - Morning1 (07:40 TPE)
 
 on:
-  # TPE 07:30 = UTC 23:30（前一天），週一早上對應「週日」UTC，
-  # 所以要寫 0-4（Sun~Thu）
-  schedule: [ { cron: '30 23 * * 0-4' } ]
+  schedule:
+    - cron: '40 23 * * 0-4'   # TPE 07:40
   workflow_dispatch: {}
 
 jobs:
   call:
     runs-on: ubuntu-latest
     steps:
-      - name: POST /cron/morning
+      - name: POST /cron/morning1
         env:
-          BASE_URL: ${{ secrets.BASE_URL }}
+          BASE_URL: ${{ secrets.BASE_URL }}   # 例：https://orbit07-webhook.onrender.com
           CRON_KEY:  ${{ secrets.CRON_KEY }}
         run: |
           set -e
           BASE="${BASE_URL%/}"
           curl -fsS --retry 3 --retry-delay 5 --max-time 25 \
             -H "Content-Type: application/json" \
-            -X POST "$BASE/cron/morning?key=$CRON_KEY" -d '{}'
+            -X POST "$BASE/cron/morning1?key=$CRON_KEY" -d '{}'
