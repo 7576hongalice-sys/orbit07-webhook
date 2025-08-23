@@ -1,4 +1,4 @@
-// === index.js（cron/broadcast + Telegram /webhook 查價(直覺輸入) + 07:40 兩段推播 + 發布到群/我：POST /pub）===
+// === index.js（cron/broadcast + Telegram /webhook 查價(直覺輸入) + 07:40 兩段推播 + 一鍵發布 + 相容 /cron/morning）===
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
@@ -96,7 +96,7 @@ app.post("/broadcast", async (req,res)=>{
   catch(e){ console.error("broadcast error:",e?.response?.data||e.message); res.status(500).json({ ok:false, error:e?.response?.data||e.message }); }
 });
 
-// ====== 一鍵發布（新增：POST /pub） ======
+// ====== 一鍵發布（POST /pub） ======
 // body: { text: "...", target: "group" | "me", mode?: "Markdown" | null }
 app.post("/pub", async (req,res)=>{
   if(!verifyKey(req,res))return;
@@ -147,7 +147,7 @@ for (const mode of ["morning","open","noon","close"]){
   });
 }
 
-// ====== 全市場查價：代號/名稱/別名（保留） ======
+// ====== 全市場查價：代號/名稱/別名 ======
 let SYMBOL_MAP = null;
 let SYMBOL_MTIME = 0;
 
@@ -298,7 +298,7 @@ app.post("/cron/morning1", async (req,res)=>{
       return res.json({ ok:true, skipped:"weekend" });
     }
     const text = await composeMorningPhase1();
-    // ★ 固定發群組（你指定的 -4906365799）
+    // 固定發群組（-4906365799）
     const r = await sendTG(text, GROUP_CHAT_ID, "Markdown");
     res.json({ ok:true, result:r, target: GROUP_CHAT_ID });
   }catch(e){
@@ -314,20 +314,38 @@ app.post("/cron/morning2", async (req,res)=>{
       return res.json({ ok:true, skipped:"weekend" });
     }
     const text = await composeMorningPhase2();
-    // 保持原邏輯：送到預設 CHAT_ID（私人），方便你審一眼
-    const r = await sendTG(text, CHAT_ID, "Markdown");
-    res.json({ ok:true, result:r, target: CHAT_ID });
+    // 先發你個人（若沒設 CHAT_ID，退而發群組）
+    const previewTarget = CHAT_ID || GROUP_CHAT_ID;
+    const r = await sendTG(text, previewTarget, "Markdown");
+    res.json({ ok:true, result:r, target: previewTarget });
   }catch(e){
     console.error("/cron/morning2 error:", e?.response?.data||e.message);
     res.status(500).json({ ok:false, error:e?.response?.data||e.message });
   }
 });
 
-// ====== Telegram /webhook：/menu + 查價（支援直覺輸入） + 發布到群（口令） ======
-async function reply(chatId, text){
-  return sendTG(text, chatId, PARSE_MODE).catch(()=>sendTG(text, chatId, null));
-}
+// 相容端點：/cron/morning（一次觸發兩段）——給舊的 GitHub Actions 用
+app.post("/cron/morning", async (req,res)=>{
+  if(!verifyKey(req,res))return;
+  try{
+    if (!isTradingWeekday()){
+      return res.json({ ok:true, skipped:"weekend" });
+    }
+    const text1 = await composeMorningPhase1();
+    const r1 = await sendTG(text1, GROUP_CHAT_ID, "Markdown");
 
+    const text2 = await composeMorningPhase2();
+    const previewTarget = CHAT_ID || GROUP_CHAT_ID;
+    const r2 = await sendTG(text2, previewTarget, "Markdown");
+
+    res.json({ ok:true, result:{ phase1:r1, phase2:r2 }, targets:{ phase1: GROUP_CHAT_ID, phase2: previewTarget }});
+  }catch(e){
+    console.error("/cron/morning error:", e?.response?.data||e.message);
+    res.status(500).json({ ok:false, error:e?.response?.data||e.message });
+  }
+});
+
+// ====== Telegram /webhook：/menu + 查價（支援直覺輸入） + 發布到群（口令） ======
 app.post("/webhook", async (req,res)=>{
   res.sendStatus(200);
   try{
@@ -354,6 +372,7 @@ app.post("/webhook", async (req,res)=>{
         "• 當然也支援：`查 2330`、`股價 台積電`",
         "",
         "07:40 兩段推播：/cron/morning1（自動發群）／/cron/morning2（先發給我看）",
+        "舊相容：/cron/morning（兩段都跑）",
         "群組群發口令（限本人）：`發布：<要發到群的全文>`",
       ].join("\n");
       return sendTG(s, chatId, "Markdown");
@@ -371,7 +390,7 @@ GROUP_CHAT_ID：${GROUP_CHAT_ID}`;
       return sendTG("清單功能之後補強（不影響查價與推播）。", chatId, null);
     }
 
-    // === 查價偵測 ===
+    // === 查價偵測（指令式 + 直覺式 + 口語式） ===
     let q = null;
 
     // (A) 指令式
