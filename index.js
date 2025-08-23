@@ -1,4 +1,4 @@
-// === index.js（cron/broadcast + Telegram /webhook 查價 + 07:40 兩段推播 + 發布到群/我：POST /pub）===
+// === index.js（cron/broadcast + Telegram /webhook 查價(直覺輸入) + 07:40 兩段推播 + 發布到群/我：POST /pub）===
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
@@ -316,7 +316,7 @@ app.post("/cron/morning2", async (req,res)=>{
   }
 });
 
-// ====== Telegram /webhook：/menu + 查價 + 發布到群（口令） ======
+// ====== Telegram /webhook：/menu + 查價（支援直覺輸入） + 發布到群（口令） ======
 function keyboard(){
   return {
     reply_markup:{
@@ -351,8 +351,9 @@ app.post("/webhook", async (req,res)=>{
     if (/^\/(start|menu)\b/i.test(text)){
       const s = [
         "✅ 我在！可以直接輸入：",
-        "• `查 2330` 或 `股價 台積電`",
-        "• `查 佳能`（代號/名稱/別名皆可）",
+        "• `2402` 或 `毅嘉`（不必加「查」）",
+        "• 口語：`台積電多少`、`2330股價`",
+        "• 當然也支援：`查 2330`、`股價 台積電`",
         "",
         "07:40 兩段推播：/cron/morning1、/cron/morning2",
         "群組群發口令（限本人）：`發布：<要發到群的全文>`",
@@ -372,13 +373,34 @@ GROUP_CHAT_ID：${GROUP_CHAT_ID}`;
       return sendTG("清單功能之後補強（不影響查價與推播）。", chatId, null);
     }
 
-    // 查價：查 2330 / 股價 台積電 / 查 佳能
+    // === 查價偵測 ===
+    // 支援三種：
+    // 1) 指令式：「查 2330」「股價 台積電」「查 毅嘉」
+    // 2) 直覺式：直接輸入「2402」或「毅嘉」
+    // 3) 口語式：「台積電多少」「2402股價」
     let q = null;
+
+    // (A) 指令式
     let m1 = text.match(/^\/?(查價|股價|查)\s+(.+)$/);
     if (m1) q = m1[2].trim();
-    if (!q && (text === "查價" || text === "/股價")) {
-      return sendTG("請輸入：查 代號或名稱（例：查 2330、股價 台積電、查 佳能）", chatId, null);
+
+    // (B) 口語/直覺：去掉標點與常見語尾詞，只保留短字串
+    if (!q) {
+      const cleaned = text
+        .replace(/[，。,\.！？!?～~()\[\]{}【】「」『』：:；;、\s]/g, "")   // 去標點/空白
+        .replace(/(股價|價格|多少|幾元|幾塊|報價)$/u, "");                  // 去語尾詞
+      // 只處理短且像代號/名稱的字串，避免誤觸
+      if (cleaned && cleaned.length <= 12 && /^[\p{L}\p{N}A-Za-z0-9\-]+$/u.test(cleaned)) {
+        q = cleaned;
+      }
     }
+
+    // 引導用（按了「查價」卻沒輸入標的）
+    if (!q && (text === "查價" || text === "/股價")) {
+      return sendTG("請直接輸入：`2402`、`毅嘉`、或 `台積電多少`（也可：`查 2330`）", chatId, "Markdown");
+    }
+
+    // 真正查價
     if (q){
       const hit = await resolveSymbol(q);
       if (!hit) return sendTG(`查無對應代號/名稱：「${q}」\n可在 ${SYMBOLS_PATH} 加入別名，或用代號再試試。`, chatId, null);
@@ -390,6 +412,7 @@ GROUP_CHAT_ID：${GROUP_CHAT_ID}`;
       return sendTG(line, chatId, "Markdown");
     }
 
+    // 其它文字就回覆已收到（避免沉默）
     if (text) await sendTG(`收到：「${text}」`, chatId, null);
   }catch(e){
     console.error("/webhook error:", e?.response?.data||e.message);
