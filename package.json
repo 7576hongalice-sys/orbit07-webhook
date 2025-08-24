@@ -2,12 +2,13 @@
   "name": "orbit07-webhook",
   "version": "2.3.0",
   "description": "ORBIT-07 Telegram bot (cron endpoints, broadcast, webhook price lookup, lists, markdown fallback)",
+  "private": true,
   "main": "index.js",
   "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=18" },
+  "engines": { "node": ">=18.17.0 <19" },
   "dependencies": {
-    "axios": "^1.7.7",
-    "express": "^4.19.2",
-    "rss-parser": "^3.13.0"
+    "axios": "1.7.7",
+    "express": "4.19.2",
+    "rss-parser": "3.13.0"
   }
 }
