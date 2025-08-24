@@ -1,9 +1,8 @@
-// === index.js（cron/broadcast + Telegram /webhook 查價(直覺輸入) + 07:40 兩段推播 + 一鍵發布 + 相容 /cron/morning + 清單增刪 + /lists）===
+// === index.js（Telegram bot + 查價 + 清單增刪 + 盤前兩段 + Gist持久層 + /lists + /watchlist）===
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
 const path = require("path");
-
 const Parser = require("rss-parser");
 const parser = new Parser();
 
@@ -15,7 +14,14 @@ const CRON_KEY     = process.env.CRON_KEY || "";        // /cron/*、/broadcast�
 const TZ           = process.env.TZ || "Asia/Taipei";
 const PARSE_MODE   = process.env.PARSE_MODE || "Markdown";
 const SYMBOLS_PATH = process.env.SYMBOLS_PATH || "./symbols.json"; // 可選
-const LISTS_PATH   = process.env.LISTS_PATH   || "./lists.json";    // 追蹤清單持久化
+
+// —— Gist（主持久層，優先）
+const GIST_TOKEN    = process.env.GIST_TOKEN || "";
+const GIST_ID       = process.env.GIST_ID || "";
+const GIST_FILENAME = process.env.GIST_FILENAME || "watchlist.json";
+
+// —— 本機檔（後備持久層；Gist 不可用時才會用）
+const LISTS_PATH    = process.env.LISTS_PATH || "./data/lists.json";
 
 // 主人與群組
 const OWNER_ID       = Number(process.env.OWNER_ID || 8418229161);     // 你的 TG user id
@@ -38,7 +44,7 @@ function isTradingWeekday(){
   return wd >= 1 && wd <= 5;
 }
 
-// ====== 模板讀取 ======
+// ====== 模板讀取（保留擴充） ======
 async function readTemplate(name){
   const p = path.join(__dirname,"content",`${name}.txt`);
   try { const t = (await fs.readFile(p,"utf8")||"").trim(); return t||`(${name} 尚無內容)`; }
@@ -86,7 +92,7 @@ function verifyKey(req,res){
 }
 
 // 健康檢查
-app.get(["/","/health"],(_,res)=>res.send("ok"));
+app.get(["/","/health","/healthz"],(_,res)=>res.send("ok"));
 
 // ====== 手動推播（保留） ======
 app.post("/broadcast", async (req,res)=>{
@@ -208,55 +214,142 @@ async function fetchTWQuote(code){
   return { ok:false };
 }
 
-// ====== 追蹤清單持久化 ======
-let TRACK_SELF_DEFAULT = ["佳能","敬鵬","臻鼎-KY","新纖","力新","富喬","錦明"];
-let TRACK_MOM_DEFAULT  = ["台燿","順達","帆宣","漢科","毅嘉"];
-
-let TRACK_SELF = [...TRACK_SELF_DEFAULT];
-let TRACK_MOM  = [...TRACK_MOM_DEFAULT];
+// ====== 追蹤清單持久化（B 方案：存 {code,name}；Gist 優先、本機後備） ======
+let TRACK_SELF = [
+  { code:"2374", name:"佳能" }, { code:"2355", name:"敬鵬" }, { code:"4958", name:"臻鼎-KY" },
+  { code:"1409", name:"新纖" }, { code:"5202", name:"力新" }, { code:"1815", name:"富喬" },
+  { code:"3230", name:"錦明" }
+];
+let TRACK_MOM  = [
+  { code:"6274", name:"台燿" }, { code:"3211", name:"順達" }, { code:"6196", name:"帆宣" },
+  { code:"3402", name:"漢科" }, { code:"2402", name:"毅嘉" }
+];
 let LISTS_MTIME = 0;
 
-async function loadListsFromFile(){
-  try{
-    const stat = await fs.stat(LISTS_PATH).catch(()=>null);
-    if (!stat) return;
-    const raw = await fs.readFile(LISTS_PATH,"utf8");
-    const j = JSON.parse(raw||"{}");
-    if (Array.isArray(j.self)) TRACK_SELF = j.self;
-    if (Array.isArray(j.mom))  TRACK_MOM  = j.mom;
-    LISTS_MTIME = stat.mtimeMs;
-  }catch(e){ console.warn("load lists error:", e.message); }
+// —— 正規化/格式工具 —— //
+function normalizeList(list){
+  if (!Array.isArray(list)) return [];
+  const out = []; const seen = new Set();
+  for (const item of list){
+    let code="", name="";
+    if (typeof item === "string"){ code = String(item).toUpperCase(); name = BUILTIN_ALIAS[code] || ""; }
+    else if (item && item.code){ code = String(item.code).toUpperCase(); name = (item.name||"").trim(); }
+    if (!code) continue;
+    if (seen.has(code)){
+      const i = out.findIndex(x=>x.code===code);
+      if (i>=0 && !out[i].name && name) out[i].name = name;
+      continue;
+    }
+    out.push(name ? { code, name } : { code });
+    seen.add(code);
+  }
+  return out;
 }
-async function saveListsToFile(){
-  try{
-    const data = { self: TRACK_SELF, mom: TRACK_MOM, updatedAt: new Date().toISOString() };
-    await fs.writeFile(LISTS_PATH, JSON.stringify(data,null,2));
-    const stat = await fs.stat(LISTS_PATH).catch(()=>null);
-    LISTS_MTIME = stat?.mtimeMs || Date.now();
-  }catch(e){ console.warn("save lists error:", e.message); }
-}
-function fmtListLine(codeOrName){
-  const s = String(codeOrName);
-  const code = /^[0-9]/.test(s) ? s : (BUILTIN_ALIAS[s] || s);
-  const name = BUILTIN_ALIAS[code] || s;
-  return `${code} ${name||""}`.trim();
+function fmtListLine(item){
+  const code = (typeof item === "string") ? item : item.code;
+  const name = (typeof item === "object" && item.name) || BUILTIN_ALIAS[code] || "";
+  return name ? `${code} ${name}` : `${code}`;
 }
 function showLists(){
   const a = TRACK_SELF.map(fmtListLine).join("、") || "（無）";
   const b = TRACK_MOM.map(fmtListLine).join("、")  || "（無）";
   return `📌 你的追蹤股：${a}\n💡 媽媽追蹤股：${b}`;
 }
-async function parseSymbolsToCodes(s){
-  const parts = String(s||"")
-    .replace(/[，、\/\|]+/g, " ")
-    .trim().split(/\s+/).slice(0,20);
-  const out = [];
-  for (const p of parts){
-    const hit = await resolveSymbol(p);
-    if (hit && !out.includes(hit.code)) out.push(hit.code);
+// 解析「2402毅嘉 / 多檔」
+async function parseEntries(text){
+  const cleaned = String(text||"").replace(/[，。、\/\|；;]+/g," ").replace(/\s+/g," ").trim();
+  const tokens = cleaned.split(/\s+/).slice(0,50);
+  const out = []; const seen = new Set();
+  for (let t of tokens){
+    let m = t.match(/^(\d{4,5}[A-Z]?)([\u4e00-\u9fa5A-Za-z0-9\-\(\)]*)$/);
+    if (m){
+      const code = m[1].toUpperCase();
+      let name = (m[2]||"").trim() || BUILTIN_ALIAS[code] || "";
+      if (!seen.has(code)){ out.push(name?{code,name}:{code}); seen.add(code); }
+      continue;
+    }
+    const hit = await resolveSymbol(t);
+    if (hit?.code){
+      const code = hit.code.toUpperCase();
+      const name = (hit.name && !looksLikeCode(hit.name)) ? hit.name : (BUILTIN_ALIAS[code] || "");
+      if (!seen.has(code)){ out.push(name?{code,name}:{code}); seen.add(code); }
+    }
   }
   return out;
 }
+function removeCodesFromList(list, codes){
+  const set = new Set(codes.map(c=>String(c).toUpperCase()));
+  const before = list.length;
+  const after  = list.filter(it => !set.has(typeof it==="string"? it : it.code));
+  return { after, removed: before - after.length };
+}
+
+// —— 本機檔（後備） —— //
+async function fileLoad(){
+  const stat = await fs.stat(LISTS_PATH).catch(()=>null);
+  if (!stat) return;
+  const raw = await fs.readFile(LISTS_PATH,"utf8");
+  const j = JSON.parse(raw||"{}");
+  if (Array.isArray(j.self)) TRACK_SELF = normalizeList(j.self);
+  if (Array.isArray(j.mom))  TRACK_MOM  = normalizeList(j.mom);
+  LISTS_MTIME = stat.mtimeMs;
+}
+async function fileSave(){
+  const data = { self: TRACK_SELF, mom: TRACK_MOM, updatedAt: new Date().toISOString() };
+  await fs.mkdir(path.dirname(LISTS_PATH), { recursive:true });
+  await fs.writeFile(LISTS_PATH, JSON.stringify(data,null,2), "utf8");
+  const stat = await fs.stat(LISTS_PATH).catch(()=>null);
+  LISTS_MTIME = stat?.mtimeMs || Date.now();
+}
+
+// —— Gist（主要） —— //
+async function gistGetJson(){
+  const url = `https://api.github.com/gists/${GIST_ID}`;
+  const { data } = await axios.get(url, {
+    timeout: 20000,
+    headers: {
+      "Authorization": `Bearer ${GIST_TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28"
+    }
+  });
+  const file = data.files?.[GIST_FILENAME];
+  if (!file) throw new Error(`Gist 檔名不存在：${GIST_FILENAME}`);
+  if (file.truncated && file.raw_url){
+    const raw = await axios.get(file.raw_url, { timeout: 20000 }).then(r=>r.data);
+    return JSON.parse(raw||"{}");
+  }
+  return JSON.parse(file.content||"{}");
+}
+async function gistPutJson(obj){
+  const url = `https://api.github.com/gists/${GIST_ID}`;
+  const body = { files: { [GIST_FILENAME]: { content: JSON.stringify(obj, null, 2) } } };
+  await axios.patch(url, body, {
+    timeout: 20000,
+    headers: {
+      "Authorization": `Bearer ${GIST_TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28"
+    }
+  });
+}
+async function gistLoad(){
+  const j = await gistGetJson().catch(e=>{ console.warn("gistLoad error:", e?.response?.data||e.message); return null; });
+  if (j){
+    if (Array.isArray(j.self)) TRACK_SELF = normalizeList(j.self);
+    if (Array.isArray(j.mom))  TRACK_MOM  = normalizeList(j.mom);
+    LISTS_MTIME = Date.now();
+  }
+}
+async function gistSave(){
+  const data = { self: TRACK_SELF, mom: TRACK_MOM, updatedAt: new Date().toISOString() };
+  try{ await gistPutJson(data); LISTS_MTIME = Date.now(); }
+  catch(e){ console.warn("gistSave error:", e?.response?.data||e.message); try{ await fileSave(); }catch{} }
+}
+
+// —— 封裝：有 Gist 用 Gist，否則用檔案 —— //
+async function loadLists(){ return (GIST_TOKEN && GIST_ID) ? gistLoad() : fileLoad(); }
+async function saveLists(){ return (GIST_TOKEN && GIST_ID) ? gistSave() : fileSave(); }
 
 // ====== 07:40 兩階段：組稿 ======
 async function composeMorningPhase1(){
@@ -282,13 +375,13 @@ ${shot || "（稍後補充）"}
 （待補）`;
 }
 
-async function stockLine(nameOrCode){
-  const hit = await resolveSymbol(nameOrCode);
-  if (!hit) return `• ${nameOrCode}｜VWAP：—｜關鍵價：—｜操作/風控：—\n  四價：開— 高— 低— 收—`;
-  const r = await fetchTWQuote(hit.code);
-  const k = `• ${hit.code} ${hit.name || nameOrCode}｜VWAP：—｜關鍵價：—｜操作/風控：—`;
-  if (!r.ok) return `${k}\n  四價：開— 高— 低— 收—`;
-  return `${k}\n  四價：開${r.open} 高${r.high} 低${r.low} 收${r.close}`;
+async function stockLine(entry){
+  const code = (typeof entry === "string") ? entry : entry.code;
+  const niceName = (typeof entry === "object" && entry.name) || BUILTIN_ALIAS[code] || "";
+  const r = await fetchTWQuote(code);
+  const head = `• ${code} ${niceName}｜VWAP：—｜關鍵價：—｜操作/風控：—`;
+  if (!r.ok) return `${head}\n  四價：開— 高— 低— 收—`;
+  return `${head}\n  四價：開${r.open} 高${r.high} 低${r.low} 收${r.close}`;
 }
 async function composeMorningPhase2(){
   const linesSelf = await Promise.all(TRACK_SELF.map(stockLine));
@@ -310,7 +403,7 @@ app.post("/cron/morning1", async (req,res)=>{
     if (!isTradingWeekday()){
       return res.json({ ok:true, skipped:"weekend" });
     }
-    await loadListsFromFile(); // 以防外部剛改過
+    await loadLists(); // 以防外部剛改過
     const text = await composeMorningPhase1();
     const r = await sendTG(text, GROUP_CHAT_ID, "Markdown"); // 固定發群組
     res.json({ ok:true, result:r, target: GROUP_CHAT_ID });
@@ -326,7 +419,7 @@ app.post("/cron/morning2", async (req,res)=>{
     if (!isTradingWeekday()){
       return res.json({ ok:true, skipped:"weekend" });
     }
-    await loadListsFromFile();
+    await loadLists();
     const text = await composeMorningPhase2();
     const previewTarget = CHAT_ID || GROUP_CHAT_ID; // 先給你審
     const r = await sendTG(text, previewTarget, "Markdown");
@@ -344,7 +437,7 @@ app.post("/cron/morning", async (req,res)=>{
     if (!isTradingWeekday()){
       return res.json({ ok:true, skipped:"weekend" });
     }
-    await loadListsFromFile();
+    await loadLists();
     const text1 = await composeMorningPhase1();
     const r1 = await sendTG(text1, GROUP_CHAT_ID, "Markdown");
 
@@ -359,18 +452,28 @@ app.post("/cron/morning", async (req,res)=>{
   }
 });
 
-// ====== /lists：給 GPTS 同步清單用 ======
+// ====== /lists：內部同步（需 key） ======
 app.get("/lists", async (req,res)=>{
   if(!verifyKey(req,res))return;
-  await loadListsFromFile();
+  await loadLists();
   res.json({ self: TRACK_SELF, mom: TRACK_MOM, updatedAt: new Date(LISTS_MTIME||Date.now()).toISOString() });
+});
+
+// ====== /watchlist：公開給 GPTs（無驗證） ======
+app.get("/watchlist", async (_req,res)=>{
+  await loadLists();
+  res.json({
+    self: TRACK_SELF.map(x=>({ code:x.code, name:x.name||"" })),
+    mom:  TRACK_MOM.map(x=>({ code:x.code, name:x.name||"" })),
+    updatedAt: new Date(LISTS_MTIME||Date.now()).toISOString()
+  });
 });
 
 // ====== Telegram /webhook：查價 + 清單增刪 + 發布到群（口令） ======
 app.post("/webhook", async (req,res)=>{
   res.sendStatus(200);
   try{
-    await loadListsFromFile();
+    await loadLists();
 
     const up = req.body || {};
     const msg = up.message || up.edited_message || up.channel_post || up.edited_channel_post;
@@ -394,8 +497,9 @@ app.post("/webhook", async (req,res)=>{
         "• 口語：`台積電多少`、`2330股價`",
         "• 也支援：`查 2330`、`股價 台積電`",
         "",
-        "清單：`追蹤清單`｜`加觀察 2330`｜`移除觀察 2330`",
-        "媽媽清單：`媽媽追蹤股增加 2402 毅嘉`｜`媽媽追蹤股刪除 2402`",
+        "清單：`追蹤清單`｜`加觀察 2330台積電`｜`移除觀察 2330`",
+        "自然語法：`幫我追蹤 廣達`、`追蹤 2382`、`取消追蹤 2382`",
+        "媽媽清單：`媽媽追蹤股增加 2402毅嘉`｜`媽媽追蹤股刪除 2402`",
         "同步：`同步清單`（回傳目前清單與時間）",
         "",
         "07:40 兩段推播：/cron/morning1（自動發群）／/cron/morning2（先發給我看）",
@@ -405,51 +509,68 @@ app.post("/webhook", async (req,res)=>{
       return sendTG(s, chatId, "Markdown");
     }
 
-    // ====== 清單維護 ======
+    // ====== 清單維護（口令 + 自然語法） ======
     const mAddSelf = text.match(/^(?:加觀察|新增觀察)\s+(.+)$/);
     const mDelSelf = text.match(/^(?:移除觀察|刪除觀察)\s+(.+)$/);
     const mAddMom  = text.match(/^(?:媽媽|媽咪)追蹤股(?:增加|新增|加入)\s+(.+)$/);
     const mDelMom  = text.match(/^(?:媽媽|媽咪)追蹤股(?:刪除|移除|取消)\s+(.+)$/);
+    const mAddSelf2= text.match(/^我的追蹤股(?:增加|新增|加入)\s+(.+)$/);
+    const mDelSelf2= text.match(/^我的追蹤股(?:刪除|移除|取消)\s+(.+)$/);
 
-    if (mAddSelf){
-      const codes = await parseSymbolsToCodes(mAddSelf[1]);
+    // 自然語法
+    const mAddSelfNL = text.match(/^(?:幫我)?(?:追蹤|關注|加入觀察)(?:一下)?\s+(.+)$/i);
+    const mDelSelfNL = text.match(/^(?:取消|移除)(?:我的)?(?:追蹤|關注|觀察)\s+(.+)$/i);
+    const mAddMomNL  = text.match(/^幫(?:我媽|媽媽|媽咪)(?:追蹤|關注|加入觀察)(?:一下)?\s+(.+)$/i);
+    const mDelMomNL  = text.match(/^幫(?:我媽|媽媽|媽咪)(?:取消|移除)(?:追蹤|關注|觀察)\s+(.+)$/i);
+
+    async function opAdd(target, payload){
+      const entries = await parseEntries(payload);
       const added = [];
-      for (const c of codes){ if (!TRACK_SELF.includes(c)){ TRACK_SELF.push(c); added.push(c); } }
-      if (added.length){ await saveListsToFile(); }
-      const reply = `✅ 已加入觀察：${added.map(fmtListLine).join("、")||"（無變更）"}\n${showLists()}`;
-      return sendTG(reply, chatId, "Markdown");
+      for (const ent of entries){
+        if (!target.find(x => x.code === ent.code)){
+          target.push(ent.name ? { code: ent.code, name: ent.name } : { code: ent.code });
+          added.push(ent);
+        }else{
+          const i = target.findIndex(x => x.code === ent.code);
+          if (i>=0 && !target[i].name && ent.name) target[i].name = ent.name;
+        }
+      }
+      if (added.length) await saveLists();
+      return added;
     }
-    if (mDelSelf){
-      const codes = await parseSymbolsToCodes(mDelSelf[1]);
-      const before = TRACK_SELF.length;
-      TRACK_SELF = TRACK_SELF.filter(c=>!codes.includes(c));
-      const removed = before - TRACK_SELF.length;
-      if (removed) await saveListsToFile();
-      const reply = `🗑️ 已移除觀察：${codes.map(fmtListLine).join("、")||"（無）"}\n${showLists()}`;
-      return sendTG(reply, chatId, "Markdown");
+    async function opDel(targetName, payload){
+      const entries = await parseEntries(payload);
+      const codes = entries.map(e=>e.code);
+      if (targetName==="self"){
+        const r = removeCodesFromList(TRACK_SELF, codes); TRACK_SELF = r.after; if (r.removed) await saveLists();
+      }else{
+        const r = removeCodesFromList(TRACK_MOM, codes);  TRACK_MOM  = r.after; if (r.removed) await saveLists();
+      }
+      return codes;
     }
-    if (mAddMom){
-      const codes = await parseSymbolsToCodes(mAddMom[1]);
-      const added = [];
-      for (const c of codes){ if (!TRACK_MOM.includes(c)){ TRACK_MOM.push(c); added.push(c); } }
-      if (added.length){ await saveListsToFile(); }
-      const reply = `✅ 媽媽追蹤股已增加：${added.map(fmtListLine).join("、")||"（無變更）"}\n${showLists()}`;
-      return sendTG(reply, chatId, "Markdown");
+
+    if (mAddSelf || mAddSelf2 || mAddSelfNL){
+      const added = await opAdd(TRACK_SELF, (mAddSelf?.[1] || mAddSelf2?.[1] || mAddSelfNL?.[1] || "").trim());
+      return sendTG(`✅ 已加入觀察：${added.map(fmtListLine).join("、")||"（無變更）"}\n${showLists()}`, chatId, "Markdown");
     }
-    if (mDelMom){
-      const codes = await parseSymbolsToCodes(mDelMom[1]);
-      const before = TRACK_MOM.length;
-      TRACK_MOM = TRACK_MOM.filter(c=>!codes.includes(c));
-      const removed = before - TRACK_MOM.length;
-      if (removed) await saveListsToFile();
-      const reply = `🗑️ 媽媽追蹤股已刪除：${codes.map(fmtListLine).join("、")||"（無）"}\n${showLists()}`;
-      return sendTG(reply, chatId, "Markdown");
+    if (mDelSelf || mDelSelf2 || mDelSelfNL){
+      const codes = await opDel("self", (mDelSelf?.[1] || mDelSelf2?.[1] || mDelSelfNL?.[1] || "").trim());
+      return sendTG(`🗑️ 已移除觀察：${codes.map(c=>fmtListLine({code:c})).join("、")||"（無）"}\n${showLists()}`, chatId, "Markdown");
     }
+    if (mAddMom || mAddMomNL){
+      const added = await opAdd(TRACK_MOM, (mAddMom?.[1] || mAddMomNL?.[1] || "").trim());
+      return sendTG(`✅ 媽媽追蹤股已增加：${added.map(fmtListLine).join("、")||"（無變更）"}\n${showLists()}`, chatId, "Markdown");
+    }
+    if (mDelMom || mDelMomNL){
+      const codes = await opDel("mom", (mDelMom?.[1] || mDelMomNL?.[1] || "").trim());
+      return sendTG(`🗑️ 媽媽追蹤股已刪除：${codes.map(c=>fmtListLine({code:c})).join("、")||"（無）"}\n${showLists()}`, chatId, "Markdown");
+    }
+
     if (text === "追蹤清單"){
       return sendTG(showLists(), chatId, "Markdown");
     }
     if (text === "同步清單"){
-      await loadListsFromFile();
+      await loadLists();
       const s = `${showLists()}\n更新時間：${nowStr()}`;
       return sendTG(s, chatId, "Markdown");
     }
@@ -492,4 +613,4 @@ app.post("/webhook", async (req,res)=>{
   }
 });
 
-app.listen(PORT, ()=>console.log(`orbit07-webhook up on :${PORT}`));
+app.listen(PORT, ()=>console.log(`orbit07-webhook up on :${PORT} (Gist:${GIST_TOKEN && GIST_ID ? 'on' : 'off'})`));
