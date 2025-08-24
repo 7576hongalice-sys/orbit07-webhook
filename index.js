@@ -1,4 +1,6 @@
-// === index.js（cron/broadcast + Telegram /webhook 查價(直覺輸入) + 07:40 兩段推播 + 一鍵發布 + 相容 /cron/morning）===
+// === index.js（cron/broadcast + Telegram /webhook 查價(直覺輸入) + 07:40 兩段推播
+// + 一鍵發布 + 相容 /cron/morning + 追蹤清單口令/持久化 + /lists API）===
+
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
@@ -9,16 +11,16 @@ const parser = new Parser();
 
 // ---- ENV ----
 const PORT         = process.env.PORT || 3000;
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;          // 必填：你的 Telegram Bot Token
-const CHAT_ID      = process.env.CHAT_ID;               // 你的私人視窗或推播預設對象
-const CRON_KEY     = process.env.CRON_KEY || "";        // /cron/*、/broadcast、/pub 驗證用
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;              // 必填：Telegram Bot Token
+const CHAT_ID      = process.env.CHAT_ID;                   // 你的私人視窗或推播預設對象
+const CRON_KEY     = process.env.CRON_KEY || "";            // /cron/*、/broadcast、/pub、(POST /lists) 驗證
 const TZ           = process.env.TZ || "Asia/Taipei";
 const PARSE_MODE   = process.env.PARSE_MODE || "Markdown";
 const SYMBOLS_PATH = process.env.SYMBOLS_PATH || "./symbols.json"; // 全市場別名（可選）
-
+const LISTS_PATH   = process.env.LISTS_PATH || "./lists.json";      // 追蹤清單持久化（JSON 檔）
 // 主人與群組
-const OWNER_ID       = Number(process.env.OWNER_ID || 8418229161);     // 你的 TG user id
-const GROUP_CHAT_ID  = process.env.GROUP_CHAT_ID || "-4906365799";     // 群組 chat_id（負號開頭）
+const OWNER_ID       = Number(process.env.OWNER_ID || 8418229161);  // 你的 TG user id
+const GROUP_CHAT_ID  = process.env.GROUP_CHAT_ID || "-4906365799";  // 群組 chat_id（負號開頭）
 
 if (!TG_BOT_TOKEN) console.warn("⚠️  TG_BOT_TOKEN 未設定，將無法推播/回覆");
 if (!CHAT_ID)      console.warn("⚠️  CHAT_ID 未設定，/broadcast 需要 body.chat_id 或自行指定");
@@ -76,7 +78,7 @@ async function sendTG(text, chatId, mode){
   }
 }
 
-// ====== 金鑰驗證（cron/broadcast/pub 用） ======
+// ====== 金鑰驗證（cron/broadcast/pub/(POST /lists) 用） ======
 function verifyKey(req,res){
   const key = req.headers["x-webhook-key"] || req.query.key || "";
   if (!CRON_KEY) return true;
@@ -242,10 +244,33 @@ async function fetchTWQuote(code){
   return { ok:false };
 }
 
-// ====== 07:40 兩階段：組稿 ======
-const TRACK_SELF = ["佳能","敬鵬","臻鼎-KY","新纖","力新","富喬","錦明"];
-const TRACK_MOM  = ["台燿","順達","帆宣","漢科","毅嘉"];
+// ====== 追蹤清單（預設 + 持久化） ======
+let TRACK_SELF_DEFAULT = ["佳能","敬鵬","臻鼎-KY","新纖","力新","富喬","錦明"];
+let TRACK_MOM_DEFAULT  = ["台燿","順達","帆宣","漢科","毅嘉"];
 
+let TRACK_SELF = [...TRACK_SELF_DEFAULT];
+let TRACK_MOM  = [...TRACK_MOM_DEFAULT];
+
+async function loadLists(){
+  try{
+    const raw = await fs.readFile(LISTS_PATH,"utf8");
+    const j = JSON.parse(raw||"{}");
+    if (Array.isArray(j.self)) TRACK_SELF = [...new Set(j.self.filter(Boolean))];
+    if (Array.isArray(j.mom))  TRACK_MOM  = [...new Set(j.mom.filter(Boolean))];
+  }catch{ /* 初次沒有檔案就用預設 */ }
+}
+async function saveLists(){
+  const j = { self: TRACK_SELF, mom: TRACK_MOM, savedAt: nowStr() };
+  await fs.writeFile(LISTS_PATH, JSON.stringify(j,null,2));
+}
+async function ensureLists(){
+  if (!TRACK_SELF || !TRACK_MOM) { TRACK_SELF=[...TRACK_SELF_DEFAULT]; TRACK_MOM=[...TRACK_MOM_DEFAULT]; }
+}
+
+// 啟動時嘗試載入清單
+loadLists().catch(()=>{});
+
+// ====== 07:40 兩階段：組稿 ======
 async function composeMorningPhase1(){
   const shot = await fetchSnapshot();
   return `${todayDateStr()} 盤前導航 × 總覽
@@ -294,12 +319,9 @@ ${linesMom.join("\n")}
 app.post("/cron/morning1", async (req,res)=>{
   if(!verifyKey(req,res))return;
   try{
-    if (!isTradingWeekday()){
-      return res.json({ ok:true, skipped:"weekend" });
-    }
+    if (!isTradingWeekday()) return res.json({ ok:true, skipped:"weekend" });
     const text = await composeMorningPhase1();
-    // 固定發群組（-4906365799）
-    const r = await sendTG(text, GROUP_CHAT_ID, "Markdown");
+    const r = await sendTG(text, GROUP_CHAT_ID, "Markdown"); // 固定發群組
     res.json({ ok:true, result:r, target: GROUP_CHAT_ID });
   }catch(e){
     console.error("/cron/morning1 error:", e?.response?.data||e.message);
@@ -310,12 +332,9 @@ app.post("/cron/morning1", async (req,res)=>{
 app.post("/cron/morning2", async (req,res)=>{
   if(!verifyKey(req,res))return;
   try{
-    if (!isTradingWeekday()){
-      return res.json({ ok:true, skipped:"weekend" });
-    }
+    if (!isTradingWeekday()) return res.json({ ok:true, skipped:"weekend" });
     const text = await composeMorningPhase2();
-    // 先發你個人（若沒設 CHAT_ID，退而發群組）
-    const previewTarget = CHAT_ID || GROUP_CHAT_ID;
+    const previewTarget = CHAT_ID || GROUP_CHAT_ID;      // 先發你個人（沒有就發群）
     const r = await sendTG(text, previewTarget, "Markdown");
     res.json({ ok:true, result:r, target: previewTarget });
   }catch(e){
@@ -328,9 +347,7 @@ app.post("/cron/morning2", async (req,res)=>{
 app.post("/cron/morning", async (req,res)=>{
   if(!verifyKey(req,res))return;
   try{
-    if (!isTradingWeekday()){
-      return res.json({ ok:true, skipped:"weekend" });
-    }
+    if (!isTradingWeekday()) return res.json({ ok:true, skipped:"weekend" });
     const text1 = await composeMorningPhase1();
     const r1 = await sendTG(text1, GROUP_CHAT_ID, "Markdown");
 
@@ -345,7 +362,30 @@ app.post("/cron/morning", async (req,res)=>{
   }
 });
 
-// ====== Telegram /webhook：/menu + 查價（支援直覺輸入） + 發布到群（口令） ======
+// ====== /lists：提供給 GPTs 讀（GET）／（可選）寫（POST, 需 key） ======
+app.get("/lists", async (req,res)=>{
+  try{
+    await ensureLists();
+    res.json({ ok:true, self: TRACK_SELF, mom: TRACK_MOM, updatedAt: nowStr() });
+  }catch(e){
+    res.status(500).json({ ok:false, error:e?.message||"lists error" });
+  }
+});
+
+app.post("/lists", async (req,res)=>{
+  if(!verifyKey(req,res))return;
+  try{
+    const { self, mom } = req.body || {};
+    if (Array.isArray(self)) TRACK_SELF = [...new Set(self.filter(Boolean))];
+    if (Array.isArray(mom))  TRACK_MOM  = [...new Set(mom.filter(Boolean))];
+    await saveLists().catch(()=>{});
+    res.json({ ok:true, self: TRACK_SELF, mom: TRACK_MOM, savedAt: nowStr() });
+  }catch(e){
+    res.status(500).json({ ok:false, error:e?.message||"lists write error" });
+  }
+});
+
+// ====== Telegram /webhook：/menu + 查價（直覺/口語） + 發布到群（口令） + 清單維護 ======
 app.post("/webhook", async (req,res)=>{
   res.sendStatus(200);
   try{
@@ -363,31 +403,88 @@ app.post("/webhook", async (req,res)=>{
       return;
     }
 
+    // ==== 清單維護口令 ====
+    // 顯示清單
+    if (/^清單($|\s)/.test(text) || text === "清單" || text === "/清單"){
+      await ensureLists();
+      const s =
+`📋 追蹤清單（${todayDateStr()}）
+我：${TRACK_SELF.join("、") || "—"}
+媽：${TRACK_MOM.join("、") || "—"}
+
+用法：清單加 2402；清單減 2402；清單媽加 台燿；清單媽減 順達`;
+      await sendTG(s, chatId, null);
+      return;
+    }
+    if (/^清單我\b/.test(text)){
+      await ensureLists();
+      await sendTG(`我清單：${TRACK_SELF.join("、") || "—"}`, chatId, null);
+      return;
+    }
+    if (/^清單媽\b/.test(text)){
+      await ensureLists();
+      await sendTG(`媽媽清單：${TRACK_MOM.join("、") || "—"}`, chatId, null);
+      return;
+    }
+    // 加/減（我）
+    let m;
+    if ((m = text.match(/^清單加\s+(.+)/))){
+      const items = m[1].split(/[ ,，、\s]+/).map(s=>s.trim()).filter(Boolean);
+      for (const it of items){
+        const hit = await resolveSymbol(it);
+        const disp = hit ? (hit.name || hit.code) : it;
+        if (!TRACK_SELF.includes(disp)) TRACK_SELF.push(disp);
+      }
+      await saveLists().catch(()=>{});
+      await sendTG(`✅ 已加入（我）：${items.join("、")}\n目前：${TRACK_SELF.join("、")}`, chatId, null);
+      return;
+    }
+    if ((m = text.match(/^清單減\s+(.+)/))){
+      const items = m[1].split(/[ ,，、\s]+/).map(s=>s.trim()).filter(Boolean);
+      TRACK_SELF = TRACK_SELF.filter(x => !items.includes(x));
+      await saveLists().catch(()=>{});
+      await sendTG(`🗑️ 已移除（我）：${items.join("、")}\n目前：${TRACK_SELF.join("、") || "—"}`, chatId, null);
+      return;
+    }
+    // 加/減（媽）
+    if ((m = text.match(/^清單媽加\s+(.+)/))){
+      const items = m[1].split(/[ ,，、\s]+/).map(s=>s.trim()).filter(Boolean);
+      for (const it of items){
+        const hit = await resolveSymbol(it);
+        const disp = hit ? (hit.name || hit.code) : it;
+        if (!TRACK_MOM.includes(disp)) TRACK_MOM.push(disp);
+      }
+      await saveLists().catch(()=>{});
+      await sendTG(`✅ 已加入（媽媽）：${items.join("、")}\n目前：${TRACK_MOM.join("、")}`, chatId, null);
+      return;
+    }
+    if ((m = text.match(/^清單媽減\s+(.+)/))){
+      const items = m[1].split(/[ ,，、\s]+/).map(s=>s.trim()).filter(Boolean);
+      TRACK_MOM = TRACK_MOM.filter(x => !items.includes(x));
+      await saveLists().catch(()=>{});
+      await sendTG(`🗑️ 已移除（媽媽）：${items.join("、")}\n目前：${TRACK_MOM.join("、") || "—"}`, chatId, null);
+      return;
+    }
+
     // /start /menu
     if (/^\/(start|menu)\b/i.test(text)){
       const s = [
         "✅ 我在！可以直接輸入：",
         "• `2402` 或 `毅嘉`（不必加「查」）",
         "• 口語：`台積電多少`、`2330股價`",
-        "• 當然也支援：`查 2330`、`股價 台積電`",
+        "• 也支援：`查 2330`、`股價 台積電`",
         "",
-        "07:40 兩段推播：/cron/morning1（自動發群）／/cron/morning2（先發給我看）",
-        "舊相容：/cron/morning（兩段都跑）",
-        "群組群發口令（限本人）：`發布：<要發到群的全文>`",
+        "🕖 07:40：/cron/morning1（自動發群）／/cron/morning2（先發給我看）",
+        "🧩 舊相容：/cron/morning（兩段都跑）",
+        "",
+        "📋 清單維護：",
+        "• 清單、清單我、清單媽",
+        "• 清單加 2402｜清單減 2402",
+        "• 清單媽加 台燿｜清單媽減 順達",
+        "",
+        "📢 群發口令（限本人）：`發布：<要發到群的全文>`",
       ].join("\n");
       return sendTG(s, chatId, "Markdown");
-    }
-
-    if (text === "狀態" || text === "/狀態"){
-      const s = `服務：OK
-時間：${nowStr()}
-symbols：${SYMBOLS_PATH}（若不存在則使用內建別名）
-OWNER_ID：${OWNER_ID}
-GROUP_CHAT_ID：${GROUP_CHAT_ID}`;
-      return sendTG(s, chatId, null);
-    }
-    if (text === "清單" || text === "/清單"){
-      return sendTG("清單功能之後補強（不影響查價與推播）。", chatId, null);
     }
 
     // === 查價偵測（指令式 + 直覺式 + 口語式） ===
@@ -422,6 +519,7 @@ GROUP_CHAT_ID：${GROUP_CHAT_ID}`;
       return sendTG(line, chatId, "Markdown");
     }
 
+    // 其它文字就回覆已收到（避免沉默）
     if (text) await sendTG(`收到：「${text}」`, chatId, null);
   }catch(e){
     console.error("/webhook error:", e?.response?.data||e.message);
