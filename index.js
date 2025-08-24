@@ -1,4 +1,4 @@
-// === index.js（Telegram bot + 查價 + 清單增刪 + 盤前兩段 + Gist持久層 + /lists + /watchlist）===
+// === index.js（Telegram bot + 查價 + 清單增刪 + 盤前兩段 + Gist持久層 + /lists + /watchlist + 安全補丁）===
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs/promises");
@@ -10,7 +10,7 @@ const parser = new Parser();
 const PORT         = process.env.PORT || 3000;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;          // 必填
 const CHAT_ID      = process.env.CHAT_ID;               // 你的私人視窗
-const CRON_KEY     = process.env.CRON_KEY || "";        // /cron/*、/broadcast、/pub、/lists 驗證用
+const CRON_KEY     = process.env.CRON_KEY || "";        // /cron/*、/broadcast、/pub、/lists 驗證用（header）
 const TZ           = process.env.TZ || "Asia/Taipei";
 const PARSE_MODE   = process.env.PARSE_MODE || "Markdown";
 const SYMBOLS_PATH = process.env.SYMBOLS_PATH || "./symbols.json"; // 可選
@@ -22,6 +22,9 @@ const GIST_FILENAME = process.env.GIST_FILENAME || "watchlist.json";
 
 // —— 本機檔（後備持久層；Gist 不可用時才會用）
 const LISTS_PATH    = process.env.LISTS_PATH || "./data/lists.json";
+
+// —— Telegram webhook secret（用來驗證是真正來自 Telegram）
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 
 // 主人與群組
 const OWNER_ID       = Number(process.env.OWNER_ID || 8418229161);     // 你的 TG user id
@@ -83,11 +86,14 @@ async function sendTG(text, chatId, mode){
   }
 }
 
-// ====== 金鑰驗證（cron/broadcast/pub/lists 用） ======
+// ====== 金鑰驗證（cron/broadcast/pub/lists 用）→ 只收 Header，拒絕 ?key= ======
 function verifyKey(req,res){
-  const key = req.headers["x-webhook-key"] || req.query.key || "";
   if (!CRON_KEY) return true;
-  if (key !== CRON_KEY){ res.status(401).json({ok:false,error:"bad key"}); return false; }
+  const key = req.headers["x-webhook-key"]; // 只允許 header
+  if (key !== CRON_KEY){
+    res.status(401).json({ok:false,error:"bad key (use header x-webhook-key)"});
+    return false;
+  }
   return true;
 }
 
@@ -280,7 +286,7 @@ async function parseEntries(text){
 function removeCodesFromList(list, codes){
   const set = new Set(codes.map(c=>String(c).toUpperCase()));
   const before = list.length;
-  const after  = list.filter(it => !set.has(typeof it==="string"? it : it.code));
+  const after  = list.filter(it => !set.has((typeof it==="string")? it : it.code));
   return { after, removed: before - after.length };
 }
 
@@ -452,14 +458,16 @@ app.post("/cron/morning", async (req,res)=>{
   }
 });
 
-// ====== /lists：內部同步（需 key） ======
+// ====== /lists（內部舊端點；仍需金鑰） + /watchlist（公開） ======
 app.get("/lists", async (req,res)=>{
   if(!verifyKey(req,res))return;
   await loadLists();
-  res.json({ self: TRACK_SELF, mom: TRACK_MOM, updatedAt: new Date(LISTS_MTIME||Date.now()).toISOString() });
+  res.json({
+    self: TRACK_SELF.map(x=>({ code:x.code, name:x.name||"" })),
+    mom:  TRACK_MOM.map(x=>({ code:x.code, name:x.name||"" })),
+    updatedAt: new Date(LISTS_MTIME||Date.now()).toISOString()
+  });
 });
-
-// ====== /watchlist：公開給 GPTs（無驗證） ======
 app.get("/watchlist", async (_req,res)=>{
   await loadLists();
   res.json({
@@ -471,6 +479,10 @@ app.get("/watchlist", async (_req,res)=>{
 
 // ====== Telegram /webhook：查價 + 清單增刪 + 發布到群（口令） ======
 app.post("/webhook", async (req,res)=>{
+  // —— B) 驗證 Telegram 的 secret token —— //
+  const ok = !WEBHOOK_SECRET || req.headers["x-telegram-bot-api-secret-token"] === WEBHOOK_SECRET;
+  if (!ok) return res.sendStatus(401);
+
   res.sendStatus(200);
   try{
     await loadLists();
@@ -487,6 +499,13 @@ app.post("/webhook", async (req,res)=>{
       const payload = text.replace(/^發布[:：]\s*/,"").trim();
       if (payload) { await sendTG(payload, GROUP_CHAT_ID, "Markdown"); }
       return;
+    }
+
+    // —— A) 只有本人或私聊可修改清單 —— //
+    function canMutate(m){
+      const fromOwner = m.from?.id === OWNER_ID;
+      const inPrivate = String(m.chat?.id) === String(CHAT_ID);
+      return fromOwner || inPrivate;
     }
 
     // /start /menu
@@ -524,6 +543,7 @@ app.post("/webhook", async (req,res)=>{
     const mDelMomNL  = text.match(/^幫(?:我媽|媽媽|媽咪)(?:取消|移除)(?:追蹤|關注|觀察)\s+(.+)$/i);
 
     async function opAdd(target, payload){
+      if (!canMutate(msg)) { await sendTG("⚠️ 只有本人能調整清單。", chatId, "Markdown"); return []; }
       const entries = await parseEntries(payload);
       const added = [];
       for (const ent of entries){
@@ -539,6 +559,7 @@ app.post("/webhook", async (req,res)=>{
       return added;
     }
     async function opDel(targetName, payload){
+      if (!canMutate(msg)) { await sendTG("⚠️ 只有本人能調整清單。", chatId, "Markdown"); return []; }
       const entries = await parseEntries(payload);
       const codes = entries.map(e=>e.code);
       if (targetName==="self"){
