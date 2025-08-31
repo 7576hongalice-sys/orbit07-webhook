@@ -1,104 +1,167 @@
-// routes-lists.js — watchlist (Gist or local) + symbols lookup
-const fs = require('fs/promises');
+// routes-lists.js — 追蹤清單 API（含 /lists/watch、/lists/add、/lists/remove…）
+// - 以 chat_id 區分使用者（可從 Telegram /id 取得）
+// - 暫存到檔案（預設 /tmp/watchlists.json；可用環境變數 WATCH_STORE 覆寫）
+// - /lists/watch 支援 ?format=md 回 Markdown，給辰財直接讀
+
+const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 
-const GIST_TOKEN    = process.env.GIST_TOKEN || '';
-const GIST_ID       = process.env.GIST_ID || '';
-const GIST_FILENAME = process.env.GIST_FILENAME || '';
-const LISTS_PATH    = process.env.LISTS_PATH || './data/lists.json';
-const SYMBOLS_PATH  = process.env.SYMBOLS_PATH || './symbols.json';
-const CRON_KEY      = process.env.CRON_KEY || '';
+const STORE = process.env.WATCH_STORE || '/tmp/watchlists.json';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 
-const BASELINE = {
-  self:[{code:'2374',name:'佳能'},{code:'2355',name:'敬鵬'},{code:'4958',name:'臻鼎-KY'},{code:'1409',name:'新纖'},{code:'5202',name:'力新'},{code:'2345',name:'富喬'},{code:'4526',name:'錦明'}],
-  mom:[{code:'6274',name:'台燿'},{code:'3211',name:'順達'},{code:'6196',name:'帆宣'},{code:'2404',name:'漢科'},{code:'2402',name:'毅嘉'}],
-  updatedAt: new Date(0).toISOString()
-};
-
-const normName = (s='') => s.toString().replace(/[()\s]/g,'').replace(/－/g,'-').replace(/-KY$/i,'').replace(/[Ａ-Ｚａ-ｚ０-９]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).toUpperCase();
-
-async function readLocalJSON(p){ try{ return JSON.parse(await fs.readFile(p,'utf8')); }catch{ return null; } }
-async function writeLocalJSON(p,obj){ await fs.mkdir(path.dirname(p),{recursive:true}); await fs.writeFile(p,JSON.stringify(obj,null,2),'utf8'); }
-
-async function readGistJSON(){
-  if(!GIST_TOKEN||!GIST_ID||!GIST_FILENAME) return null;
-  const r=await axios.get(`https://api.github.com/gists/${GIST_ID}`,{headers:{Authorization:`Bearer ${GIST_TOKEN}`},timeout:8000});
-  const f=r.data?.files?.[GIST_FILENAME]; if(!f) return null;
-  if(f.raw_url){ const raw=await axios.get(f.raw_url,{headers:{Authorization:`Bearer ${GIST_TOKEN}`},timeout:8000}); try{return JSON.parse(raw.data);}catch{ return null; } }
-  if(f.content){ try{return JSON.parse(f.content);}catch{ return null; } }
-  return null;
+function ensureDir(p) {
+  const dir = path.dirname(p);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
-async function writeGistJSON(obj){
-  if(!GIST_TOKEN||!GIST_ID||!GIST_FILENAME) return false;
-  await axios.patch(`https://api.github.com/gists/${GIST_ID}`,{files:{[GIST_FILENAME]:{content:JSON.stringify(obj,null,2)}}},{headers:{Authorization:`Bearer ${GIST_TOKEN}`,'Content-Type':'application/json'},timeout:8000});
-  return true;
-}
-async function loadWatchlist(){ return (await readGistJSON()) || (await readLocalJSON(LISTS_PATH)) || BASELINE; }
-async function saveWatchlist(obj){ obj.updatedAt=new Date().toISOString(); const ok=await writeGistJSON(obj); if(!ok) await writeLocalJSON(LISTS_PATH,obj); return obj; }
 
-async function loadSymbols(){ return await readLocalJSON(SYMBOLS_PATH); }
-async function saveSymbols(map){ await writeLocalJSON(SYMBOLS_PATH,map); return map; }
-
-module.exports = function mountLists(app){
-  app.get('/watchlist', async (_req,res)=>{
-    const wl=await loadWatchlist();
-    res.json({ self: wl.self||[], mom: wl.mom||[], updatedAt: wl.updatedAt||null });
-  });
-
-  app.post('/watchlist', async (req,res)=>{
-    if(!CRON_KEY || req.header('x-webhook-key')!==CRON_KEY) return res.status(403).json({error:'forbidden'});
-    const { list, action, code, name } = req.body || {};
-    if(!['self','mom'].includes(list) || !['add','remove'].includes(action)) return res.status(400).json({error:'bad_request'});
-
-    let wl=await loadWatchlist(); wl.self=wl.self||[]; wl.mom=wl.mom||[];
-    const arr=wl[list];
-
-    if(action==='add'){
-      let c=code, n=name;
-      if((!c || !/^\d{4}$/.test(c)) && name){
-        try{
-          const sy=await loadSymbols(); const NN=normName(name); const cand=[];
-          if(sy?.byName?.[NN]) cand.push(...sy.byName[NN]);
-          for(const [k,v] of Object.entries(sy?.byCode||{})){ if(normName(v).includes(NN)) cand.push(k); }
-          if(cand.length){ c=cand[0]; n=sy.byCode[c]||name; }
-        }catch{}
-      }
-      if(!c || !/^\d{4}$/.test(c)) return res.status(400).json({error:'need_code_or_resolvable_name'});
-      if(!arr.find(x=>x.code===c)) arr.push({ code:c, name:n||'' });
-    }else{
-      if(!/^\d{4}$/.test(code||'')) return res.status(400).json({error:'need_code'});
-      const i=arr.findIndex(x=>x.code===code); if(i>=0) arr.splice(i,1);
+function loadStore() {
+  try {
+    if (fs.existsSync(STORE)) {
+      const raw = fs.readFileSync(STORE, 'utf8');
+      return JSON.parse(raw);
     }
-    wl=await saveWatchlist(wl);
-    res.json({ ok:true, self: wl.self, mom: wl.mom, updatedAt: wl.updatedAt });
+  } catch {}
+  return { users: {} }; // { users: { [chat_id]: { user:[], mama:[] } } }
+}
+function saveStore(db) {
+  try {
+    ensureDir(STORE);
+    fs.writeFileSync(STORE, JSON.stringify(db));
+  } catch (e) {
+    console.error('saveStore failed:', e.message || e);
+  }
+}
+function normalizeCode(s) {
+  const m = String(s || '').match(/\d{4}/);
+  return m ? m[0] : null;
+}
+
+async function fetchNamesMap(codes = []) {
+  // 向 TWSE MIS 取名稱（同時嘗試 tse_/otc_）
+  const unique = Array.from(new Set(codes.filter(Boolean)));
+  if (!unique.length) return {};
+  const channels = [];
+  for (const c of unique) channels.push(`tse_${c}.tw`, `otc_${c}.tw`);
+  const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(channels.join('|'))}`;
+  try {
+    const { data } = await axios.get(url, {
+      timeout: 10000,
+      headers: { 'User-Agent': UA, 'Referer': 'https://mis.twse.com.tw/stock/index.jsp' }
+    });
+    const arr = data?.msgArray || [];
+    const out = {};
+    for (const it of arr) {
+      const code = it.c;
+      const name = it.n || '';
+      if (code && name && !out[code]) out[code] = name;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function mdList(title, items) {
+  const lines = [`**${title}**`];
+  if (!items?.length) {
+    lines.push('- （空）');
+  } else {
+    for (const t of items) lines.push(`- ${t}`);
+  }
+  return lines.join('\n');
+}
+
+module.exports = function mountLists(app) {
+  // 健康檢查（給 keep-alive）
+  app.get('/lists/ping', (_req, res) => {
+    res.json({ ok: true, store: STORE });
   });
 
-  app.get('/symbols/lookup', async (req,res)=>{
-    const q=(req.query.q||'').toString().trim(); const sy=await loadSymbols();
-    if(!q || !sy) return res.json({ matches: [] });
-    const n=normName(q); const out=new Map();
-    if(/^\d{4}$/.test(q) && sy.byCode[q]) out.set(q, sy.byCode[q]);
-    (sy.byName?.[n]||[]).forEach(c=> out.set(c, sy.byCode[c]||''));
-    for(const [c, nm] of Object.entries(sy.byCode)){ if(normName(nm).includes(n)) out.set(c, nm); }
-    res.json({ matches: Array.from(out.entries()).slice(0,10).map(([code,name])=>({code,name})) });
+  // 列出追蹤清單
+  // GET /lists/watch?chat_id=8418229161&format=md
+  app.get('/lists/watch', async (req, res) => {
+    const chatId = (req.query.chat_id || '').toString().trim();
+    const format = (req.query.format || 'json').toString().toLowerCase();
+
+    if (!chatId) {
+      return res.status(400).json({ ok: false, error: 'chat_id required' });
+    }
+
+    const db = loadStore();
+    const bucket = db.users[chatId] || { user: [], mama: [] };
+
+    // 取名稱（可失敗，失敗就只顯示代號）
+    const codes = Array.from(new Set([...(bucket.user||[]), ...(bucket.mama||[])]));
+    const nameMap = await fetchNamesMap(codes);
+
+    const userWithName = (bucket.user || []).map(c => nameMap[c] ? `${nameMap[c]}（${c}）` : c);
+    const mamaWithName = (bucket.mama || []).map(c => nameMap[c] ? `${nameMap[c]}（${c}）` : c);
+
+    if (format === 'md' || format === 'markdown' || format === 'text') {
+      const parts = [
+        '以下是你的觀察股：',
+        mdList('使用者追蹤', userWithName),
+        '',
+        mdList('媽媽追蹤（必分析）', mamaWithName)
+      ];
+      res.type('text/plain').send(parts.join('\n'));
+    } else {
+      res.json({
+        ok: true,
+        chat_id: chatId,
+        items: {
+          user: bucket.user || [],
+          mama: bucket.mama || []
+        },
+        names: nameMap
+      });
+    }
   });
 
-  app.post('/symbols/refresh', async (req,res)=>{
-    if(!CRON_KEY || req.header('x-webhook-key')!==CRON_KEY) return res.status(403).json({error:'forbidden'});
-    try{
-      const r=await axios.get('https://api.finmindtrade.com/api/v4/data',{ params:{ dataset:'TaiwanStockInfo' }, timeout:12000 });
-      const rows=r.data?.data||[]; const byCode={}, byName={};
-      for(const it of rows){
-        const code=it.stock_id, name=it.stock_name;
-        if(!/^\d{4}$/.test(code)||!name) continue;
-        byCode[code]=name;
-        const nn=normName(name);
-        byName[nn]=byName[nn]||[];
-        if(!byName[nn].includes(code)) byName[nn].push(code);
-      }
-      await saveSymbols({ byCode, byName, updatedAt: new Date().toISOString(), count: Object.keys(byCode).length });
-      res.json({ ok:true, count:Object.keys(byCode).length });
-    }catch(e){ res.status(502).json({ error:'source_unavailable', detail:e?.message||e }); }
+  // 新增（便利 GET 版）
+  // GET /lists/add?chat_id=8418229161&code=2330&bucket=user
+  app.get('/lists/add', (req, res) => {
+    const chatId = (req.query.chat_id || '').toString().trim();
+    const code = normalizeCode(req.query.code);
+    const bucketName = (req.query.bucket || 'user').toString().toLowerCase(); // user | mama
+    if (!chatId || !code) return res.status(400).json({ ok: false, error: 'chat_id & code required' });
+    if (!['user', 'mama'].includes(bucketName)) return res.status(400).json({ ok: false, error: 'bucket must be user|mama' });
+
+    const db = loadStore();
+    if (!db.users[chatId]) db.users[chatId] = { user: [], mama: [] };
+    const arr = db.users[chatId][bucketName];
+    if (!arr.includes(code)) arr.push(code);
+    saveStore(db);
+
+    res.json({ ok: true, chat_id: chatId, bucket: bucketName, added: code, items: db.users[chatId] });
+  });
+
+  // 移除（便利 GET 版）
+  // GET /lists/remove?chat_id=8418229161&code=2330&bucket=user
+  app.get('/lists/remove', (req, res) => {
+    const chatId = (req.query.chat_id || '').toString().trim();
+    const code = normalizeCode(req.query.code);
+    const bucketName = (req.query.bucket || 'user').toString().toLowerCase();
+    if (!chatId || !code) return res.status(400).json({ ok: false, error: 'chat_id & code required' });
+    if (!['user', 'mama'].includes(bucketName)) return res.status(400).json({ ok: false, error: 'bucket must be user|mama' });
+
+    const db = loadStore();
+    if (!db.users[chatId]) db.users[chatId] = { user: [], mama: [] };
+    db.users[chatId][bucketName] = (db.users[chatId][bucketName] || []).filter(c => c !== code);
+    saveStore(db);
+
+    res.json({ ok: true, chat_id: chatId, bucket: bucketName, removed: code, items: db.users[chatId] });
+  });
+
+  // 清空
+  // GET /lists/clear?chat_id=8418229161
+  app.get('/lists/clear', (req, res) => {
+    const chatId = (req.query.chat_id || '').toString().trim();
+    if (!chatId) return res.status(400).json({ ok: false, error: 'chat_id required' });
+    const db = loadStore();
+    db.users[chatId] = { user: [], mama: [] };
+    saveStore(db);
+    res.json({ ok: true, chat_id: chatId, cleared: true });
   });
 };
