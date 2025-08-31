@@ -29,7 +29,7 @@ const CRON_KEY       = process.env.CRON_KEY || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const PARSE_MODE     = process.env.PARSE_MODE || "Markdown";
 
-const VERSION = "2025-08-31-LI3+WATCHCMD";
+const VERSION = "2025-08-31-LI3";
 
 if (!TG_BOT_TOKEN) {
   console.error("❌ TG_BOT_TOKEN 未設定，系統無法發送 Telegram 訊息。");
