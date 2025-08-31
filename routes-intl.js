@@ -1,4 +1,5 @@
-// routes-intl.js — International snapshot & headlines (legal-only, with fallbacks)
+// routes-intl.js — International snapshot & headlines (keyless sources)
+// 來源：TradingEconomics guest:guest（指數、商品、債券、美元）＋ 白名單 RSS
 const axios = require('axios');
 const Parser = require('rss-parser');
 
@@ -8,34 +9,31 @@ const DEFAULT_NEWS = [
   'https://apnews.com/hub/ap-top-news?utm_source=rss'
 ];
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 
-async function yahooQuote(symbols) {
-  // 先試 query2，再試 query1
-  const urls = [
-    `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols.join(','))}`,
-    `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols.join(','))}`
-  ];
-  let lastErr;
-  for (const url of urls) {
-    try {
-      const { data } = await axios.get(url, { timeout: 9000, headers: { 'User-Agent': UA, 'Accept': 'application/json' } });
-      return data?.quoteResponse?.result || [];
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr || new Error('yahooQuote failed');
+// ---- TradingEconomics helpers (no key needed: guest:guest) ----
+async function teGet(path) {
+  const url = `https://api.tradingeconomics.com${path}${path.includes('?') ? '&' : '?'}c=guest:guest&format=json`;
+  const { data } = await axios.get(url, { timeout: 10000, headers: { 'User-Agent': UA, Accept: 'application/json' } });
+  return Array.isArray(data) ? data : [];
 }
-
-async function fred10Y() {
-  // 用 FRED 更權威；沒 key 也先嘗試（某些區域仍可取到），失敗就回 null
-  const key = process.env.FRED_KEY || '';
-  const url = `https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&sort_order=desc&limit=1${key ? `&api_key=${key}` : ''}&file_type=json`;
-  try {
-    const { data } = await axios.get(url, { timeout: 9000, headers: { 'User-Agent': UA } });
-    const v = data?.observations?.[0]?.value;
-    const val = v && v !== '.' ? Number(v) : null;
-    return val ? { close: val } : null;
-  } catch { return null; }
+function pickByName(rows, keywords) {
+  const ks = keywords.map(k => k.toLowerCase());
+  return rows.find(r => {
+    const name = (r.name || r.symbol || r.ticker || '').toLowerCase();
+    return ks.every(k => name.includes(k));
+  }) || null;
+}
+function toField(row) {
+  if (!row) return null;
+  // TradingEconomics 常見欄位：last / change / changesPercentage
+  const close = Number(row.last ?? row.close ?? row.price ?? row.value);
+  const pct   = Number(row.changesPercentage ?? row.change_percent ?? row.changepct ?? row.chg_pct);
+  return {
+    close: isFinite(close) ? close : null,
+    pct: isFinite(pct) ? pct : null,
+    source: 'TE'
+  };
 }
 
 module.exports = function mountIntl(app) {
@@ -50,75 +48,47 @@ module.exports = function mountIntl(app) {
       spx:null, ndx:null, dji:null, sox:null, vix:null, dxy:null, us10y:null, wti:null, brent:null, gold:null
     };
 
-    // 第一層：指數/指標原生代碼
-    const primary = ['^GSPC','^IXIC','^DJI','^SOX','^VIX','DX-Y.NYB','DXY','^TNX','CL=F','BZ=F','GC=F'];
-    // 第二層：ETF 代理（取價＆漲跌幅）：SPX→SPY、NDX→QQQ、DJI→DIA、SOX→SOXX、DXY→UUP
-    const proxyMap = { spx:'SPY', ndx:'QQQ', dji:'DIA', sox:'SOXX', dxy:'UUP', gold:'GLD' };
-
-    function setField(obj, key, q) {
-      if (!q) return;
-      obj[key] = {
-        close: q.regularMarketPrice ?? null,
-        pct: q.regularMarketChangePercent ?? null,
-        symbol: q.symbol
-      };
-    }
-
     try {
-      // 取 primary
-      const qs = await yahooQuote(primary);
-      const pick = s => qs.find(q => q.symbol === s) || null;
+      // 指數
+      const indices = await teGet('/markets/indices');
+      // 商品
+      const comm    = await teGet('/markets/commodities');
+      // 債券（收益率）
+      const bonds   = await teGet('/markets/bonds');
+      // 外匯／美元指數
+      const fx      = await teGet('/markets/forex');
 
-      setField(out, 'spx',  pick('^GSPC'));
-      setField(out, 'ndx',  pick('^IXIC'));
-      setField(out, 'dji',  pick('^DJI'));
-      setField(out, 'sox',  pick('^SOX'));
-      setField(out, 'vix',  pick('^VIX'));
-      setField(out, 'dxy',  pick('DX-Y.NYB') || pick('DXY'));
-      setField(out, 'wti',  pick('CL=F'));
-      setField(out, 'brent',pick('BZ=F'));
-      setField(out, 'gold', pick('GC=F'));
+      // S&P 500 / Nasdaq 100 / Dow Jones / SOX / VIX
+      out.spx = toField(pickByName(indices, ['s&p', '500'])) || toField(pickByName(indices, ['spx']));
+      out.ndx = toField(pickByName(indices, ['nasdaq', '100'])) || toField(pickByName(indices, ['nasdaq']));
+      out.dji = toField(pickByName(indices, ['dow', 'jones']))  || toField(pickByName(indices, ['dow']));
+      // 半導體指數（名稱在 TE 可能是 Philadelphia/PHLX Semiconductor）
+      out.sox = toField(pickByName(indices, ['semiconductor'])) || null;
+      // VIX（Volatility）
+      out.vix = toField(pickByName(indices, ['volatility', 'vix'])) || null;
 
-      // TNX（*10 = 基點）；轉成殖利率 %
-      const tnx = pick('^TNX');
-      if (tnx && typeof tnx.regularMarketPrice === 'number') {
-        out.us10y = { close: Number(tnx.regularMarketPrice)/10, symbol: '^TNX' };
-      }
+      // 美元指數（Dollar Index / US Dollar Index）
+      out.dxy = toField(pickByName(indices, ['dollar', 'index'])) ||
+                toField(pickByName(fx, ['dollar', 'index'])) || null;
+
+      // 10Y
+      out.us10y = toField(pickByName(bonds, ['10', 'year'])) ||
+                  toField(pickByName(bonds, ['ten', 'year'])) || null;
+
+      // 商品
+      out.wti   = toField(pickByName(comm, ['crude', 'oil', 'wti'])) || null;
+      out.brent = toField(pickByName(comm, ['brent'])) || null;
+      out.gold  = toField(pickByName(comm, ['gold']))  || null;
+
+      // 註記缺項
+      ['spx','ndx','dji','sox','vix','dxy','us10y','wti','brent','gold'].forEach(k => {
+        if (!out[k]) out.notes.push(`missing ${k}`);
+      });
     } catch (e) {
-      out.notes.push('primary yahooQuote failed: ' + (e?.message || e));
+      out.notes.push('tradingeconomics fetch failed: ' + (e?.message || e));
     }
 
-    // 若 primary 有缺，再用 ETF 代理補齊
-    try {
-      const need = [];
-      if (!out.spx)  need.push(proxyMap.spx);
-      if (!out.ndx)  need.push(proxyMap.ndx);
-      if (!out.dji)  need.push(proxyMap.dji);
-      if (!out.sox)  need.push(proxyMap.sox);
-      if (!out.dxy)  need.push(proxyMap.dxy);
-      if (!out.gold) need.push(proxyMap.gold);
-      if (need.length) {
-        const qs2 = await yahooQuote(need);
-        const pick2 = s => qs2.find(q => q.symbol === s) || null;
-        if (!out.spx)  setField(out, 'spx',  pick2(proxyMap.spx));
-        if (!out.ndx)  setField(out, 'ndx',  pick2(proxyMap.ndx));
-        if (!out.dji)  setField(out, 'dji',  pick2(proxyMap.dji));
-        if (!out.sox)  setField(out, 'sox',  pick2(proxyMap.sox));
-        if (!out.dxy)  setField(out, 'dxy',  pick2(proxyMap.dxy));
-        if (!out.gold) setField(out, 'gold', pick2(proxyMap.gold));
-        out.notes.push('filled by ETF proxies where needed');
-      }
-    } catch (e) {
-      out.notes.push('proxy yahooQuote failed: ' + (e?.message || e));
-    }
-
-    // US10Y 再補 FRED（若前面沒拿到）
-    if (!out.us10y) {
-      const fred = await fred10Y();
-      if (fred) { out.us10y = fred; out.us10y.source = 'FRED:DGS10'; }
-    }
-
-    return res.json(out);
+    res.json(out);
   });
 
   // GET /intl/news_headlines?limit=5
@@ -139,7 +109,7 @@ module.exports = function mountIntl(app) {
           });
           if (items.length >= limit) break;
         }
-      } catch { /* ignore single-source failure */ }
+      } catch { /* 單源失敗略過 */ }
       if (items.length >= limit) break;
     }
     res.json({ items: items.slice(0, limit) });
