@@ -70,15 +70,16 @@ async function finmindInstFlows(code, days=5){
     const byDate = new Map();
     for (const it of rows){
       const d  = it.date || it.Date;
-      const b  = Number(it.buy ?? it.Buy ?? 0);
+      const b  = Number(it.buy  ?? it.Buy  ?? 0);
       const s2 = Number(it.sell ?? it.Sell ?? 0);
-      const net = Number(it.net_buy_sell ?? it.NetBuySell ?? (b - s2) || 0);
+      // ✅ 修正：避免 ?? 與 || 混用（加括號，並用 ?? 0）
+      const net = Number((it.net_buy_sell ?? it.NetBuySell ?? (b - s2)) ?? 0);
       byDate.set(d, (byDate.get(d) || 0) + net);
     }
     const dates = Array.from(byDate.keys()).sort();
     const lastN = dates.slice(-days);
     const sum5  = lastN.reduce((a,d)=> a + (byDate.get(d)||0), 0);
-    const last1 = byDate.get(last(dates)) || 0;
+    const last1 = byDate.get(dates[dates.length-1]) || 0;
     return { sum5, last1 };
   }catch{ return { sum5:0, last1:0 }; }
 }
