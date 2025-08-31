@@ -5,13 +5,16 @@
 //   TG_BOT_TOKEN=<你的 Bot Token>
 //   CHAT_ID=<你的個人 chat_id，正數>
 //   GROUP_CHAT_ID=<你的群組 chat_id，-100 開頭的負數>   ← 群播需要
-//   CRON_KEY=<任意32字以上隨機字元，當作 /pub /broadcast 的金鑰>
+//   CRON_KEY=<任意32字以上隨機字元，當作 /pub /broadcast 的金鑰，也供寫入 watchlist/symbols 用>
 //   WEBHOOK_SECRET=<任意32字以上隨機字元，給 Telegram Webhook 驗證>
 //
 // 可選：
 //   PORT=3000
 //   PARSE_MODE=Markdown        (也可用 HTML)
 //   TZ=Asia/Taipei
+//   NEWS_RSS_SOURCES=合法新聞RSS白名單（逗號分隔）
+//   SYMBOLS_PATH=./symbols.json（名稱↔代號索引本機檔）
+//   GIST_TOKEN/GIST_ID/GIST_FILENAME（若用 Gist 存 watchlist）
 
 process.env.TZ = process.env.TZ || "Asia/Taipei";
 
@@ -20,6 +23,12 @@ const axios = require("axios");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+
+// === ORBIT07 add-ons: 國際盤＋白名單新聞 / 追蹤清單＋名稱→代號 ===
+// 這兩行會掛上下方你新增的 routes 檔案（請確保已放在專案根目錄）
+require("./routes-intl")(app);
+require("./routes-lists")(app);
+// （可選）若之後要做 Weekly Capsule 自動接力，再：require("./routes-capsule")(app);
 
 // ---- ENV ------------------------------------------------------------
 const PORT           = parseInt(process.env.PORT || "3000", 10);
@@ -279,7 +288,6 @@ app.post("/webhook", async (req, res) => {
     }
 
     // 其他訊息：可視需要回覆或忽略
-    // 這裡我們只在私聊時回覆指引
     if (msg.chat?.type === "private") {
       await sendWithRetry(
         [
