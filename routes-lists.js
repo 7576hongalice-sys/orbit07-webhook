@@ -1,20 +1,19 @@
-// routes-lists.js — 追蹤清單 API（含 /lists/watch、/lists/add、/lists/remove…）
-// - 以 chat_id 區分使用者（可從 Telegram /id 取得）
-// - 暫存到檔案（預設 /tmp/watchlists.json；可用環境變數 WATCH_STORE 覆寫）
-// - /lists/watch 支援 ?format=md 回 Markdown，給辰財直接讀
+// routes-lists.js — 追蹤清單 API（watch/add/remove/clear + 批次 + 名稱對應）
+// - 以 chat_id 區分使用者
+// - 預設存到 /tmp/watchlists.json（Render 會清空）；建議用 WATCH_STORE=/data/watchlists.json 並掛 Disk 到 /data
+// - /lists/watch 支援 ?format=md，給「辰財」直接讀；同時提供 JSON 給程式用
 
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 
 const STORE = process.env.WATCH_STORE || '/tmp/watchlists.json';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+const UA    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 
 function ensureDir(p) {
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
-
 function loadStore() {
   try {
     if (fs.existsSync(STORE)) {
@@ -28,18 +27,24 @@ function saveStore(db) {
   try {
     ensureDir(STORE);
     fs.writeFileSync(STORE, JSON.stringify(db));
+    return true;
   } catch (e) {
     console.error('saveStore failed:', e.message || e);
+    return false;
   }
 }
-function normalizeCode(s) {
-  const m = String(s || '').match(/\d{4}/);
-  return m ? m[0] : null;
+function normalizeCodes(input) {
+  // 支援 codes=2330,2603 或空白、換行；僅取 4~6 位數字
+  const arr = String(input || '')
+    .split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
+    .map(s => s.replace(/[^\d]/g, ''))
+    .filter(s => s.length >= 4 && s.length <= 6);
+  return Array.from(new Set(arr));
 }
 
-async function fetchNamesMap(codes = []) {
-  // 向 TWSE MIS 取名稱（同時嘗試 tse_/otc_）
-  const unique = Array.from(new Set(codes.filter(Boolean)));
+// 取得名稱對應（TWSE MIS）
+async function fetchNames(codes = []) {
+  const unique = Array.from(new Set((codes || []).filter(Boolean)));
   if (!unique.length) return {};
   const channels = [];
   for (const c of unique) channels.push(`tse_${c}.tw`, `otc_${c}.tw`);
@@ -49,119 +54,109 @@ async function fetchNamesMap(codes = []) {
       timeout: 10000,
       headers: { 'User-Agent': UA, 'Referer': 'https://mis.twse.com.tw/stock/index.jsp' }
     });
-    const arr = data?.msgArray || [];
-    const out = {};
-    for (const it of arr) {
-      const code = it.c;
-      const name = it.n || '';
-      if (code && name && !out[code]) out[code] = name;
+    const map = {};
+    for (const it of (data?.msgArray || [])) {
+      const code = it.c, name = it.n;
+      if (code && name && !map[code]) map[code] = name;
     }
-    return out;
-  } catch {
-    return {};
-  }
+    return map;
+  } catch { return {}; }
 }
 
 function mdList(title, items) {
   const lines = [`**${title}**`];
-  if (!items?.length) {
-    lines.push('- （空）');
-  } else {
-    for (const t of items) lines.push(`- ${t}`);
-  }
+  if (!items?.length) lines.push('- （空）');
+  else for (const t of items) lines.push(`- ${t}`);
   return lines.join('\n');
 }
 
 module.exports = function mountLists(app) {
-  // 健康檢查（給 keep-alive）
-  app.get('/lists/ping', (_req, res) => {
-    res.json({ ok: true, store: STORE });
-  });
+  // keep-alive / 健康檢查
+  app.get('/lists/ping', (_req, res) => res.json({ ok: true, store: STORE }));
 
-  // 列出追蹤清單
-  // GET /lists/watch?chat_id=8418229161&format=md
+  // 讀清單
+  // GET /lists/watch?chat_id=8418229161&format=md|json
   app.get('/lists/watch', async (req, res) => {
-    const chatId = (req.query.chat_id || '').toString().trim();
-    const format = (req.query.format || 'json').toString().toLowerCase();
+    try {
+      const chatId = String(req.query.chat_id || '').trim();
+      const format = String(req.query.format || 'json').toLowerCase();
+      if (!chatId) return res.status(400).json({ ok:false, error:'chat_id required' });
 
-    if (!chatId) {
-      return res.status(400).json({ ok: false, error: 'chat_id required' });
-    }
+      const db = loadStore();
+      const bucket = db.users[chatId] || { user: [], mama: [] };
+      const codes = Array.from(new Set([...(bucket.user||[]), ...(bucket.mama||[])]));
+      const nameMap = await fetchNames(codes);
 
-    const db = loadStore();
-    const bucket = db.users[chatId] || { user: [], mama: [] };
+      const userWithName = (bucket.user || []).map(c => nameMap[c] ? `${nameMap[c]}（${c}）` : c);
+      const mamaWithName = (bucket.mama || []).map(c => nameMap[c] ? `${nameMap[c]}（${c}）` : c);
 
-    // 取名稱（可失敗，失敗就只顯示代號）
-    const codes = Array.from(new Set([...(bucket.user||[]), ...(bucket.mama||[])]));
-    const nameMap = await fetchNamesMap(codes);
-
-    const userWithName = (bucket.user || []).map(c => nameMap[c] ? `${nameMap[c]}（${c}）` : c);
-    const mamaWithName = (bucket.mama || []).map(c => nameMap[c] ? `${nameMap[c]}（${c}）` : c);
-
-    if (format === 'md' || format === 'markdown' || format === 'text') {
-      const parts = [
-        '以下是你的觀察股：',
-        mdList('使用者追蹤', userWithName),
-        '',
-        mdList('媽媽追蹤（必分析）', mamaWithName)
-      ];
-      res.type('text/plain').send(parts.join('\n'));
-    } else {
-      res.json({
-        ok: true,
-        chat_id: chatId,
-        items: {
-          user: bucket.user || [],
-          mama: bucket.mama || []
-        },
-        names: nameMap
-      });
+      if (format === 'md' || format === 'markdown' || format === 'text') {
+        res.type('text/plain').send(
+          ['以下是你的觀察股：', mdList('使用者追蹤', userWithName), '', mdList('媽媽追蹤（必分析）', mamaWithName)].join('\n')
+        );
+      } else {
+        res.json({ ok:true, chat_id: chatId, items: { user: bucket.user || [], mama: bucket.mama || [] }, names: nameMap });
+      }
+    } catch (e) {
+      res.status(500).json({ ok:false, error: String(e.message || e) });
     }
   });
 
-  // 新增（便利 GET 版）
-  // GET /lists/add?chat_id=8418229161&code=2330&bucket=user
-  app.get('/lists/add', (req, res) => {
-    const chatId = (req.query.chat_id || '').toString().trim();
-    const code = normalizeCode(req.query.code);
-    const bucketName = (req.query.bucket || 'user').toString().toLowerCase(); // user | mama
-    if (!chatId || !code) return res.status(400).json({ ok: false, error: 'chat_id & code required' });
-    if (!['user', 'mama'].includes(bucketName)) return res.status(400).json({ ok: false, error: 'bucket must be user|mama' });
+  // 新增（支援多檔）：GET/POST /lists/add?chat_id=..&codes=2330,2603&bucket=user|mama
+  async function addHandler(req, res) {
+    try {
+      const chatId = String(req.body.chat_id || req.query.chat_id || '').trim();
+      const codes = normalizeCodes(req.body.codes || req.query.codes || req.body.code || req.query.code || '');
+      const bucketName = String(req.body.bucket || req.query.bucket || 'user').toLowerCase(); // user|mama
+      if (!chatId) return res.status(400).json({ ok:false, error:'chat_id required' });
+      if (!codes.length) return res.status(400).json({ ok:false, error:'codes required' });
+      if (!['user','mama'].includes(bucketName)) return res.status(400).json({ ok:false, error:'bucket must be user|mama' });
 
-    const db = loadStore();
-    if (!db.users[chatId]) db.users[chatId] = { user: [], mama: [] };
-    const arr = db.users[chatId][bucketName];
-    if (!arr.includes(code)) arr.push(code);
-    saveStore(db);
+      const db = loadStore();
+      if (!db.users[chatId]) db.users[chatId] = { user: [], mama: [] };
+      const set = new Set(db.users[chatId][bucketName] || []);
+      for (const c of codes) set.add(c);
+      db.users[chatId][bucketName] = Array.from(set);
+      saveStore(db);
+      res.json({ ok:true, chat_id: chatId, bucket: bucketName, items: db.users[chatId] });
+    } catch (e) {
+      res.status(500).json({ ok:false, error: String(e.message || e) });
+    }
+  }
+  app.post('/lists/add', addHandler);
+  app.get('/lists/add', addHandler);
 
-    res.json({ ok: true, chat_id: chatId, bucket: bucketName, added: code, items: db.users[chatId] });
-  });
+  // 移除（支援多檔）：GET/POST /lists/remove?chat_id=..&codes=2330,2603&bucket=user|mama
+  async function removeHandler(req, res) {
+    try {
+      const chatId = String(req.body.chat_id || req.query.chat_id || '').trim();
+      const codes = normalizeCodes(req.body.codes || req.query.codes || req.body.code || req.query.code || '');
+      const bucketName = String(req.body.bucket || req.query.bucket || 'user').toLowerCase();
+      if (!chatId) return res.status(400).json({ ok:false, error:'chat_id required' });
+      if (!codes.length) return res.status(400).json({ ok:false, error:'codes required' });
+      if (!['user','mama'].includes(bucketName)) return res.status(400).json({ ok:false, error:'bucket must be user|mama' });
 
-  // 移除（便利 GET 版）
-  // GET /lists/remove?chat_id=8418229161&code=2330&bucket=user
-  app.get('/lists/remove', (req, res) => {
-    const chatId = (req.query.chat_id || '').toString().trim();
-    const code = normalizeCode(req.query.code);
-    const bucketName = (req.query.bucket || 'user').toString().toLowerCase();
-    if (!chatId || !code) return res.status(400).json({ ok: false, error: 'chat_id & code required' });
-    if (!['user', 'mama'].includes(bucketName)) return res.status(400).json({ ok: false, error: 'bucket must be user|mama' });
-
-    const db = loadStore();
-    if (!db.users[chatId]) db.users[chatId] = { user: [], mama: [] };
-    db.users[chatId][bucketName] = (db.users[chatId][bucketName] || []).filter(c => c !== code);
-    saveStore(db);
-
-    res.json({ ok: true, chat_id: chatId, bucket: bucketName, removed: code, items: db.users[chatId] });
-  });
+      const db = loadStore();
+      if (!db.users[chatId]) db.users[chatId] = { user: [], mama: [] };
+      const arr = (db.users[chatId][bucketName] || []).filter(c => !codes.includes(c));
+      db.users[chatId][bucketName] = arr;
+      saveStore(db);
+      res.json({ ok:true, chat_id: chatId, bucket: bucketName, items: db.users[chatId] });
+    } catch (e) {
+      res.status(500).json({ ok:false, error: String(e.message || e) });
+    }
+  }
+  app.post('/lists/remove', removeHandler);
+  app.get('/lists/remove', removeHandler);
 
   // 清空
-  // GET /lists/clear?chat_id=8418229161
+  // GET /lists/clear?chat_id=...
   app.get('/lists/clear', (req, res) => {
-    const chatId = (req.query.chat_id || '').toString().trim();
-    if (!chatId) return res.status(400).json({ ok: false, error: 'chat_id required' });
+    const chatId = String(req.query.chat_id || '').trim();
+    if (!chatId) return res.status(400).json({ ok:false, error:'chat_id required' });
     const db = loadStore();
     db.users[chatId] = { user: [], mama: [] };
     saveStore(db);
-    res.json({ ok: true, chat_id: chatId, cleared: true });
+    res.json({ ok:true, chat_id: chatId, cleared: true });
   });
 };
