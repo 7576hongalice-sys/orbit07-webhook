@@ -12,9 +12,11 @@ app.use(express.json({ limit: "1mb" }));
 require("./routes-intl")(app);   // 國際盤＋白名單新聞
 require("./routes-lists")(app);  // 追蹤清單＋名稱↔代號
 require("./routes-tw")(app);     // 台股收盤（TWSE MIS / FinMind）
-// 新增：
+// 新增（你要的）： 
 require("./routes-score")(app);  // ✅ 共振計分＋建議價位（key/低接/停損/T1/T2）
 require("./routes-draft")(app);  // ✅ 盤前導航草稿（自動組模板＋四價建議）
+require("./routes-inst")(app);   // ✅ 上市：TWSE 三大法人 T86／彙總
+require("./routes-tpex")(app);   // ✅ 上櫃：TPEx 三大法人 明細／彙總
 
 // ---- ENV ------------------------------------------------------------
 const PORT           = parseInt(process.env.PORT || "3000", 10);
@@ -25,14 +27,10 @@ const CRON_KEY       = process.env.CRON_KEY || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const PARSE_MODE     = process.env.PARSE_MODE || "Markdown";
 
-const VERSION = "2025-08-31-INTL3";
+const VERSION = "2025-08-31-LI3";
 
-if (!TG_BOT_TOKEN) {
-  console.error("❌ TG_BOT_TOKEN 未設定，系統無法發送 Telegram 訊息。");
-}
+// (略) —— 以下與你原本相同 —— 
 const TG_API = `https://api.telegram.org/bot${TG_BOT_TOKEN}`;
-
-// ---- 工具 -----------------------------------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const norm = (s = "") => String(s).replace(/\uFF5C/g, "|").replace(/\r\n/g, "\n");
 
@@ -49,11 +47,9 @@ function verifyTelegram(req, res) {
   return true;
 }
 
-// ---- Telegram 發送 ---------------------------------------------------
 async function sendTG(text, chatId, mode = PARSE_MODE, opts = {}) {
   if (!TG_BOT_TOKEN) throw new Error("TG_BOT_TOKEN not set");
   if (!chatId) throw new Error("chat_id is required");
-
   const url = `${TG_API}/sendMessage`;
   const base = {
     chat_id: chatId, text: norm(text), parse_mode: mode,
@@ -61,7 +57,6 @@ async function sendTG(text, chatId, mode = PARSE_MODE, opts = {}) {
     message_thread_id: opts.thread_id, reply_to_message_id: opts.reply_to,
     allow_sending_without_reply: true, disable_notification: opts.silent ?? false,
   };
-
   try {
     const { data } = await axios.post(url, base, { timeout: 25000 });
     return data;
@@ -82,42 +77,33 @@ async function sendWithRetry(text, chatId, mode, opts) {
   throw lastErr;
 }
 
-// ---- 健康檢查 -------------------------------------------------------
 app.get("/healthz", (_req, res) => {
   res.json({ ok:true, version: VERSION, tz: process.env.TZ, has_token: !!TG_BOT_TOKEN, has_owner: !!CHAT_ID, has_group: !!GROUP_CHAT_ID });
 });
 
-// ---- 手動推播 -------------------------------------------------------
 app.post("/pub", async (req, res) => {
   if (!requireKey(req, res)) return;
   const { text, target = "group", mode, thread_id, silent, disable_preview } = req.body || {};
   if (!text) return res.status(400).json({ ok:false, error:"text required" });
-
   try {
     const chat = target === "me" ? CHAT_ID : (GROUP_CHAT_ID || null);
     if (!chat) return res.status(400).json({ ok:false, error: (target === "me" ? "CHAT_ID" : "GROUP_CHAT_ID") + " missing" });
-
     const r = await sendWithRetry(text, chat, mode, { thread_id, silent, disable_preview });
     res.json({ ok:true, result:r, target });
-  } catch (e) {
-    res.status(502).json({ ok:false, error:String(e.message || e) });
-  }
+  } catch (e) { res.status(502).json({ ok:false, error:String(e.message || e) }); }
 });
 
 app.post("/broadcast", async (req, res) => {
   if (!requireKey(req, res)) return;
   const { text, to = ["me","group"] } = req.body || {};
   if (!text) return res.status(400).json({ ok:false, error:"text required" });
-
   const tasks = [];
   if (to.includes("me")) tasks.push(CHAT_ID ? sendWithRetry(text, CHAT_ID) : Promise.reject(new Error("CHAT_ID missing")));
   if (to.includes("group")) tasks.push(GROUP_CHAT_ID ? sendWithRetry(text, GROUP_CHAT_ID) : Promise.reject(new Error("GROUP_CHAT_ID missing")));
-
   try { const results = await Promise.allSettled(tasks); res.json({ ok:true, results }); }
   catch (e) { res.status(502).json({ ok:false, error:String(e.message || e) }); }
 });
 
-// ---- Cron 範例 ------------------------------------------------------
 app.post("/cron/morning", async (req, res) => {
   if (!requireKey(req, res)) return;
   if (!GROUP_CHAT_ID) return res.status(400).json({ ok:false, error:"GROUP_CHAT_ID missing" });
@@ -128,15 +114,12 @@ app.post("/cron/morning", async (req, res) => {
   } catch (e) { res.status(502).json({ ok:false, error:String(e.message || e) }); }
 });
 
-// ---- Telegram Webhook -----------------------------------------------
 app.post("/webhook", async (req, res) => {
   if (!verifyTelegram(req, res)) return;
   const update = req.body || {};
   const msg = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
   res.json({ ok:true }); if (!msg) return;
-
   const chatId = msg.chat?.id; const text = msg.text || msg.caption || ""; const from = msg.from?.username || msg.from?.first_name || "someone";
-
   try {
     if (/^\/id\b/i.test(text)) {
       const info = [`🆔 chat_id: \`${chatId}\``,`👤 from: ${from}`,`💬 type: ${msg.chat?.type}`].join("\n");
