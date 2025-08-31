@@ -12,10 +12,10 @@ app.use(express.json({ limit: "1mb" }));
 // === 掛路由（務必在 app.listen 之前） ================================
 // 既有：
 require("./routes-intl")(app);   // 國際盤＋白名單新聞
-require("./routes-lists")(app);  // 追蹤清單＋名稱↔代號 搜尋
+require("./routes-lists")(app);  // 追蹤清單＋名稱↔代號
 require("./routes-tw")(app);     // 台股收盤（TWSE MIS / FinMind）
-// 你需要的新增：
-require("./routes-score")(app);  // 共振計分＋建議價位（key/低接/停損/T1/T2）
+// 你加的：
+require("./routes-score")(app);  // 共振計分＋建議價位
 require("./routes-draft")(app);  // 盤前導航草稿
 require("./routes-inst")(app);   // 上市：TWSE 三大法人
 require("./routes-tpex")(app);   // 上櫃：TPEx 三大法人
@@ -29,14 +29,14 @@ const CRON_KEY       = process.env.CRON_KEY || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const PARSE_MODE     = process.env.PARSE_MODE || "Markdown";
 
-const VERSION = "2025-08-31-WLJSON";
+const VERSION = "2025-08-31-WATCHCMD+SMARTSYM";
 
 if (!TG_BOT_TOKEN) {
   console.error("❌ TG_BOT_TOKEN 未設定，系統無法發送 Telegram 訊息。");
 }
 const TG_API = `https://api.telegram.org/bot${TG_BOT_TOKEN}`;
 
-// ---- 工具 -----------------------------------------------------------
+// ---- 小工具 ---------------------------------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const norm = (s = "") => String(s).replace(/\uFF5C/g, "|").replace(/\r\n/g, "\n");
 
@@ -84,9 +84,8 @@ async function sendWithRetry(text, chatId, mode, opts) {
   throw lastErr;
 }
 
-// ---- Watchlist I/O（本地檔；供 Telegram 指令與 /watchlist 使用） ----
+// ---- Watchlist I/O（與 /watchlist 頁面共用） -------------------------
 const WATCHLIST_FILE = path.join(__dirname, "content", "watchlist.json");
-
 async function readWatchlist() {
   try {
     const txt = await fs.readFile(WATCHLIST_FILE, "utf8");
@@ -105,30 +104,44 @@ async function writeWatchlist(j) {
   return j;
 }
 
-// 名稱/代號解析（走你自己的 lists 路由）
+// === 強化版名稱/代號解析 ==============================================
+// 支援：只輸入代號、只輸入名稱、或「代號+名稱」混合（例：`4541 晟田`）
 async function resolveSymbol(q) {
-  const base = `http://127.0.0.1:${PORT}`;
-  const isCode = /^\d{4}[A-Z]?$/i.test(q.trim());
+  // 標準化字串（去全形空白、中文逗號、多重空格）
+  q = String(q || "")
+        .replace(/\u3000/g, " ")
+        .replace(/[，、]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 
-  // 代號 → 名稱
-  if (isCode) {
+  const base = `http://127.0.0.1:${PORT}`;
+
+  // 1) 先從字串抓 4 碼(可帶一位英文字母)的代號
+  const m = q.match(/\b(\d{4}[A-Z]?)\b/i);
+  if (m) {
+    const code = m[1].toUpperCase();
     try {
-      const { data } = await axios.get(`${base}/lists/symbol`, { params: { name: q }, timeout: 10000 });
+      const { data } = await axios.get(`${base}/lists/symbol`, { params: { name: code }, timeout: 10000 });
       if (data?.code) return { code: String(data.code), name: data.name || "" };
     } catch {}
-    return { code: q.trim(), name: "" };
+    // 沒查到名稱也先回代號（名稱日後補）
+    return { code, name: "" };
   }
-  // 名稱 → 代號（精準）
-  try {
-    const { data } = await axios.get(`${base}/lists/symbol`, { params: { name: q }, timeout: 10000 });
-    if (data?.code) return { code: String(data.code), name: data.name || q };
-  } catch {}
-  // 名稱 → 代號（模糊）
-  try {
-    const { data } = await axios.get(`${base}/lists/search`, { params: { q }, timeout: 10000 });
-    const hit = data?.items?.[0];
-    if (hit) return { code: String(hit.code || hit.stock_id || hit.id), name: hit.name || hit.stock_name || q };
-  } catch {}
+
+  // 2) 沒代號就用名稱做精準查
+  if (q) {
+    try {
+      const { data } = await axios.get(`${base}/lists/symbol`, { params: { name: q }, timeout: 10000 });
+      if (data?.code) return { code: String(data.code), name: data.name || q };
+    } catch {}
+    // 3) 再模糊搜一輪，取第一筆
+    try {
+      const { data } = await axios.get(`${base}/lists/search`, { params: { q, limit: 5 }, timeout: 10000 });
+      const hit = data?.items?.[0];
+      if (hit) return { code: String(hit.code || hit.stock_id || hit.id), name: hit.name || hit.stock_name || q };
+    } catch {}
+  }
+
   return null;
 }
 async function upsertWatch(which, code, name = "") {
@@ -147,44 +160,6 @@ async function removeWatch(which, code) {
   await writeWatchlist(wl);
   return wl;
 }
-
-// ---- /watchlist：預設 JSON，?format=md 回 Markdown -------------------
-function renderWatchlistMarkdown(wl) {
-  const toLines = (arr) =>
-    (arr && arr.length)
-      ? arr.map(x => `- ${x.code} ${x.name || ""}`.trim()).join("\n")
-      : "- （空）";
-  return [
-    "以下是你的觀察股：",
-    "**使用者追蹤**",
-    toLines(wl.self || []),
-    "",
-    "**媽媽追蹤（必分析）**",
-    toLines(wl.mom || []),
-  ].join("\n");
-}
-app.get("/watchlist", async (req, res) => {
-  try {
-    const wl = await readWatchlist();
-    res.set("Cache-Control", "no-store");
-    res.set("Access-Control-Allow-Origin", "*"); // 讓 GPT Actions 可抓
-
-    const fmt = String(req.query.format || "json").toLowerCase();
-    if (fmt === "md" || fmt === "markdown") {
-      res.type("text/markdown").send(renderWatchlistMarkdown(wl));
-    } else {
-      res.type("application/json").json({
-        self: wl.self || [],
-        mom: wl.mom || [],
-        updatedAt: wl.updatedAt || null,
-      });
-    }
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e.message || e) });
-  }
-});
-// 相容舊路徑
-app.get("/lists/watch", (_req, res) => res.redirect(302, "/watchlist?format=md"));
 
 // ---- 健康檢查 -------------------------------------------------------
 app.get("/healthz", (_req, res) => {
@@ -220,11 +195,7 @@ app.post("/cron/morning", async (req, res) => {
   if (!requireKey(req, res)) return;
   if (!GROUP_CHAT_ID) return res.status(400).json({ ok:false, error:"GROUP_CHAT_ID missing" });
   try {
-    const text = [
-      "📣 早安提醒",
-      "- 這是 /cron/morning 範例訊息。",
-      "- 若你看到這則訊息，代表群組推播管道正常運作。"
-    ].join("\n");
+    const text = ["📣 早安提醒","- 這是 /cron/morning 範例訊息。","- 若你看到這則訊息，代表群組推播管道正常運作。"].join("\n");
     const r = await sendWithRetry(text, GROUP_CHAT_ID);
     res.json({ ok:true, result:r });
   } catch (e) { res.status(502).json({ ok:false, error:String(e.message || e) }); }
@@ -242,7 +213,7 @@ app.post("/webhook", async (req, res) => {
   const from = msg.from?.username || msg.from?.first_name || "someone";
 
   try {
-    // 基本指令
+    // 既有基本指令
     if (/^\/id\b/i.test(text)) {
       const info = [`🆔 chat_id: \`${chatId}\``,`👤 from: ${from}`,`💬 type: ${msg.chat?.type}`].join("\n");
       await sendWithRetry(info, chatId, "Markdown"); return;
@@ -256,7 +227,7 @@ app.post("/webhook", async (req, res) => {
       await sendWithRetry("已嘗試轉播到群組。", chatId); return;
     }
 
-    // === 觀察清單中文指令 =============================================
+    // === 觀察清單中文指令 ============================================
     let m;
     // 自己清單：加
     if ((m = text.match(/^(?:加觀察|新增觀察|加入觀察)\s+(.+)$/i))) {
@@ -301,7 +272,9 @@ app.post("/webhook", async (req, res) => {
       const mom = wl.mom .map(x => `${x.code} ${x.name||""}`.trim()).join("、") || "（空）";
       await sendWithRetry(
         `📋 觀察：${me}\n👩‍🍼 媽媽：${mom}\n\n🔎 瀏覽器檢視： https://orbit07-webhook.onrender.com/watchlist`,
-        chatId, undefined, { disable_preview: false }
+        chatId,
+        undefined,
+        { disable_preview: false }
       );
       return;
     }
