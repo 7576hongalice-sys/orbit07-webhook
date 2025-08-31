@@ -1,10 +1,21 @@
 name: keep-alive
+
 on:
+  # 交易時段保活（台北 07:00–14:00，週一～週五）
+  # 轉成 UTC（+8）：23:00–06:59
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/10 23,0-6 * * 1-5"   # 每 10 分鐘
+  workflow_dispatch:                # 需要時可手動點「Run workflow」
+
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+    concurrency:
+      group: keep-alive
+      cancel-in-progress: true
     steps:
-      - name: ping healthz
+      - name: Hit healthz
         run: curl -fsS https://orbit07-webhook.onrender.com/healthz || true
+      - name: Hit intl snapshot (optional)
+        run: curl -fsS https://orbit07-webhook.onrender.com/intl/market_snapshot || true
