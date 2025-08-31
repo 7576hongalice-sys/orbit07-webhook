@@ -1,0 +1,10 @@
+name: keep-alive
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping healthz
+        run: curl -fsS https://orbit07-webhook.onrender.com/healthz || true
