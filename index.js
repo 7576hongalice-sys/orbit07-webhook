@@ -7,10 +7,14 @@ const axios = require("axios");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// === 掛路由（放在 app.listen 之前） ===
+// === 掛路由（務必在 app.listen 之前） ================================
+// 既有：
 require("./routes-intl")(app);   // 國際盤＋白名單新聞
 require("./routes-lists")(app);  // 追蹤清單＋名稱↔代號
 require("./routes-tw")(app);     // 台股收盤（TWSE MIS / FinMind）
+// 新增：
+require("./routes-score")(app);  // ✅ 共振計分＋建議價位（key/低接/停損/T1/T2）
+require("./routes-draft")(app);  // ✅ 盤前導航草稿（自動組模板＋四價建議）
 
 // ---- ENV ------------------------------------------------------------
 const PORT           = parseInt(process.env.PORT || "3000", 10);
@@ -21,7 +25,7 @@ const CRON_KEY       = process.env.CRON_KEY || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const PARSE_MODE     = process.env.PARSE_MODE || "Markdown";
 
-const VERSION = "2025-08-31-02";
+const VERSION = "2025-08-31-03";
 
 if (!TG_BOT_TOKEN) {
   console.error("❌ TG_BOT_TOKEN 未設定，系統無法發送 Telegram 訊息。");
