@@ -1,83 +1,118 @@
-// routes-intl.js — International snapshot & headlines (keyless sources)
+// routes-intl.js — International snapshot + headlines (no API keys)
+// Sources:
+//   - Indices/VIX: Stooq CSV (free, legal): https://stooq.com
+//   - Macro (rates/FX/commodities): FRED CSV (free): https://fred.stlouisfed.org
+//   - Headlines: WSJ Markets RSS (whitelisted)
+//
+// Endpoints:
+//   GET /intl/market_snapshot
+//   GET /intl/news_headlines?limit=5
+//
 const axios = require('axios');
-const Parser = require('rss-parser');
-
-const DEFAULT_NEWS = [
-  'https://www.reuters.com/markets/rss',
-  'https://feeds.a.dj.com/rss/RSSMarketsMain.xml',
-  'https://apnews.com/hub/ap-top-news?utm_source=rss'
-];
+const RSSParser = require('rss-parser');
+const parser = new RSSParser();
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 
-async function teGet(path) {
-  const url = `https://api.tradingeconomics.com${path}${path.includes('?') ? '&' : '?'}c=guest:guest&format=json`;
-  const { data } = await axios.get(url, { timeout: 10000, headers: { 'User-Agent': UA, Accept: 'application/json' } });
-  return Array.isArray(data) ? data : [];
+// ---------- utilities ----------
+const toNum = (x) => {
+  if (x == null) return null;
+  const n = Number(String(x).trim());
+  return Number.isFinite(n) ? n : null;
+};
+function lastTwoNumbers(rows) {
+  // rows: array of {date, value} sorted asc or desc; pick last two numeric
+  const vals = rows
+    .map(r => toNum(r.value))
+    .filter(v => Number.isFinite(v));
+  if (vals.length < 2) return { last: null, prev: null };
+  return { last: vals[vals.length - 1], prev: vals[vals.length - 2] };
 }
-function pickByName(rows, keywords) {
-  const ks = keywords.map(k => k.toLowerCase());
-  return rows.find(r => {
-    const name = (r.name || r.symbol || r.ticker || '').toLowerCase();
-    return ks.every(k => name.includes(k));
-  }) || null;
-}
-function toField(row) {
-  if (!row) return null;
-  const close = Number(row.last ?? row.close ?? row.price ?? row.value);
-  const pct   = Number(row.changesPercentage ?? row.change_percent ?? row.changepct ?? row.chg_pct);
-  return { close: isFinite(close) ? close : null, pct: isFinite(pct) ? pct : null, source: 'TE' };
+const pct = (a, b) => (Number.isFinite(a) && Number.isFinite(b) && b !== 0)
+  ? +(((a - b) / b) * 100).toFixed(2)
+  : null;
+
+// ---------- Stooq: daily CSV for indices/VIX/ETFs ----------
+async function stooqDaily(symbol) {
+  // CSV header: Date,Open,High,Low,Close,Volume
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d`;
+  const { data } = await axios.get(url, { timeout: 12000, headers: { 'User-Agent': UA } });
+  const lines = String(data).trim().split(/\r?\n/);
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const [Date, Open, High, Low, Close/*, Volume*/] = lines[i].split(',');
+    const v = toNum(Close);
+    if (v != null) out.push({ date: Date, value: v });
+  }
+  const { last, prev } = lastTwoNumbers(out);
+  return { close: last, pct: pct(last, prev) };
 }
 
+// ---------- FRED: CSV without API key ----------
+async function fredLatest(seriesId) {
+  // Example: https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10
+  const url = `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}`;
+  const { data } = await axios.get(url, { timeout: 12000, headers: { 'User-Agent': UA } });
+  const lines = String(data).trim().split(/\r?\n/);
+  // header: "DATE,<ID>"
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const [date, val] = lines[i].split(',');
+    const v = toNum(val);
+    if (v != null) out.push({ date, value: v });
+  }
+  const { last, prev } = lastTwoNumbers(out);
+  return { close: last, pct: pct(last, prev) };
+}
+
+// ---------- snapshot route ----------
 module.exports = function mountIntl(app) {
-  const NEWS_RSS_SOURCES = (process.env.NEWS_RSS_SOURCES || DEFAULT_NEWS.join(','))
-    .split(',').map(s => s.trim()).filter(Boolean);
-
   app.get('/intl/market_snapshot', async (_req, res) => {
-    const out = { date: new Date().toISOString().slice(0,10), notes: [], spx:null, ndx:null, dji:null, sox:null, vix:null, dxy:null, us10y:null, wti:null, brent:null, gold:null };
-    try {
-      const indices = await teGet('/markets/indices');
-      const comm    = await teGet('/markets/commodities');
-      const bonds   = await teGet('/markets/bonds');
-      const fx      = await teGet('/markets/forex');
+    const today = new Date().toISOString().slice(0, 10);
+    const notes = [];
 
-      out.spx = toField(pickByName(indices, ['s&p','500'])) || toField(pickByName(indices, ['spx']));
-      out.ndx = toField(pickByName(indices, ['nasdaq','100'])) || toField(pickByName(indices, ['nasdaq']));
-      out.dji = toField(pickByName(indices, ['dow','jones']))  || toField(pickByName(indices, ['dow']));
-      out.sox = toField(pickByName(indices, ['semiconductor'])) || null;
-      out.vix = toField(pickByName(indices, ['volatility','vix'])) || null;
+    // Stooq indices (免 key)
+    // 指數：^spx, ^ndx, ^dji, ^vix；SOX 沒有官方值 → 用 SOXX ETF 作為 proxy
+    let spx, ndx, dji, vix, sox;
+    try { spx = await stooqDaily('^spx'); } catch { notes.push('stooq ^spx failed'); spx = { close: null, pct: null }; }
+    try { ndx = await stooqDaily('^ndx'); } catch { notes.push('stooq ^ndx failed'); ndx = { close: null, pct: null }; }
+    try { dji = await stooqDaily('^dji'); } catch { notes.push('stooq ^dji failed'); dji = { close: null, pct: null }; }
+    try { vix = await stooqDaily('^vix'); } catch { notes.push('stooq ^vix failed'); vix = { close: null, pct: null }; }
+    try { sox = await stooqDaily('soxx.us'); notes.push('SOX via SOXX proxy'); }
+    catch { notes.push('stooq soxx.us failed'); sox = { close: null, pct: null }; }
 
-      out.dxy = toField(pickByName(indices, ['dollar','index'])) ||
-                toField(pickByName(fx, ['dollar','index'])) || null;
+    // FRED series (免 key)
+    // 美元指數用 DTWEXBGS（Broad Dollar Index, daily）替代 DXY
+    // 10年期殖利率 DGS10，原油/布蘭特/黃金用官方系列
+    let dxy, us10y, wti, brent, gold;
+    try { dxy   = await fredLatest('DTWEXBGS'); } catch { notes.push('fred DTWEXBGS failed'); dxy = { close: null, pct: null }; }
+    try { us10y = await fredLatest('DGS10');     } catch { notes.push('fred DGS10 failed');     us10y = { close: null, pct: null }; }
+    try { wti   = await fredLatest('DCOILWTICO');} catch { notes.push('fred DCOILWTICO failed'); wti = { close: null, pct: null }; }
+    try { brent = await fredLatest('DCOILBRENTEU'); } catch { notes.push('fred DCOILBRENTEU failed'); brent = { close: null, pct: null }; }
+    try { gold  = await fredLatest('GOLDAMGBD228NLBM'); } catch { notes.push('fred GOLDAMGBD228NLBM failed'); gold = { close: null, pct: null }; }
 
-      out.us10y = toField(pickByName(bonds, ['10','year'])) || toField(pickByName(bonds, ['ten','year'])) || null;
-
-      out.wti   = toField(pickByName(comm, ['crude','oil','wti'])) || null;
-      out.brent = toField(pickByName(comm, ['brent'])) || null;
-      out.gold  = toField(pickByName(comm, ['gold']))  || null;
-
-      ['spx','ndx','dji','sox','vix','dxy','us10y','wti','brent','gold'].forEach(k => { if (!out[k]) out.notes.push(`missing ${k}`); });
-    } catch (e) {
-      out.notes.push('tradingeconomics fetch failed: ' + (e?.message || e));
-    }
-    res.json(out);
+    res.json({
+      date: today,
+      notes,
+      spx, ndx, dji, sox, vix,
+      dxy, us10y, wti, brent, gold
+    });
   });
 
+  // 簡易白名單新聞（WSJ Markets RSS）
   app.get('/intl/news_headlines', async (req, res) => {
-    const limit = Math.max(1, Math.min(Number(req.query.limit || 5), 20));
-    const items = [];
-    const parser = new Parser({ timeout: 8000, headers: { 'User-Agent': UA } });
-
-    for (const feed of NEWS_RSS_SOURCES) {
-      try {
-        const f = await parser.parseURL(feed);
-        for (const it of f.items || []) {
-          items.push({ title: it.title || '', source: f.title || 'news', url: it.link || '', published_at: it.isoDate || it.pubDate || '' });
-          if (items.length >= limit) break;
-        }
-      } catch {}
-      if (items.length >= limit) break;
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '6', 10), 1), 12);
+    try {
+      const feed = await parser.parseURL('https://feeds.a.dj.com/rss/RSSMarketsMain.xml');
+      const items = (feed.items || []).slice(0, limit).map(it => ({
+        title: it.title,
+        source: 'WSJ.com: Markets',
+        url: it.link,
+        published_at: it.isoDate || it.pubDate
+      }));
+      res.json({ items });
+    } catch (e) {
+      res.status(502).json({ ok:false, error: String(e?.message || e) });
     }
-    res.json({ items: items.slice(0, limit) });
   });
 };
