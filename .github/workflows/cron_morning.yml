@@ -1,21 +1,26 @@
-name: ORBIT07 - Morning1 (07:40 TPE)
+name: ORBIT07 - Premarket (07:30 TPE)
 
 on:
   schedule:
-    - cron: '40 23 * * 0-4'   # TPE 07:40
+    - cron: '30 23 * * 0-4'   # UTC Sun-Thu 23:30 = TPE Mon-Fri 07:30
   workflow_dispatch: {}
+
+concurrency:
+  group: orbit07-premarket
+  cancel-in-progress: false
 
 jobs:
   call:
     runs-on: ubuntu-latest
     steps:
-      - name: POST /cron/morning1
+      - name: POST /cron/premarket
         env:
-          BASE_URL: ${{ secrets.BASE_URL }}   # 例：https://orbit07-webhook.onrender.com
+          BASE_URL: ${{ secrets.BASE_URL }}
           CRON_KEY:  ${{ secrets.CRON_KEY }}
         run: |
           set -e
           BASE="${BASE_URL%/}"
           curl -fsS --retry 3 --retry-delay 5 --max-time 25 \
             -H "Content-Type: application/json" \
-            -X POST "$BASE/cron/morning1?key=$CRON_KEY" -d '{}'
+            -H "X-Cron-Key: $CRON_KEY" \
+            -X POST "$BASE/cron/premarket" -d '{}'
