@@ -3,9 +3,12 @@ const test = require("node:test");
 const express = require("express");
 
 const {
+  createGitHubReader,
   mountPremarket,
   runPremarketGate,
 } = require("../modules/premarket");
+
+const FAKE_READ_TOKEN = "fake-private-read-token-for-tests";
 
 const LABELS = [
   ["加權指數", ["twse_index"]],
@@ -182,4 +185,148 @@ test("gate failure never invokes post-gate processing", async () => {
     assert.equal((await response.json()).premarket_ready, false);
   });
   assert.equal(downstreamCalls, 0);
+});
+
+function apiFile(path, value) {
+  return {
+    type: "file",
+    path,
+    encoding: "base64",
+    content: Buffer.from(typeof value === "string" ? value : JSON.stringify(value), "utf8").toString("base64"),
+  };
+}
+
+function httpClientReturning(payload) {
+  return { async get() { return { status: 200, data: payload }; } };
+}
+
+test("private reader sends the expected Bearer authorization header", async () => {
+  let request;
+  const client = {
+    async get(url, options) {
+      request = { url, options };
+      return { data: apiFile("data/latest/status.json", statusFixture()) };
+    },
+  };
+  const reader = createGitHubReader(client, { token: FAKE_READ_TOKEN });
+  await reader.readText("data/latest/status.json");
+  assert.match(request.url, /^https:\/\/api\.github\.com\/repos\/7576hongalice-sys\/chencai-postmarket-data\/contents\//);
+  assert.match(request.url, /\?ref=main$/);
+  assert.equal(request.options.headers.Authorization, `Bearer ${FAKE_READ_TOKEN}`);
+  assert.equal(request.options.headers.Accept, "application/vnd.github+json");
+});
+
+test("missing private read token fails closed", async () => {
+  const reader = createGitHubReader(httpClientReturning({}), { token: undefined });
+  await assert.rejects(reader.readText("data/latest/status.json"),
+    (error) => error.code === "missing_read_token");
+});
+
+test("empty private read token fails closed", async () => {
+  const reader = createGitHubReader(httpClientReturning({}), { token: "   " });
+  await assert.rejects(reader.readText("data/latest/status.json"),
+    (error) => error.code === "missing_read_token");
+});
+
+for (const status of [401, 403, 404, 429, 500]) {
+  test(`GitHub HTTP ${status} fails closed`, async () => {
+    const client = { async get() { const error = new Error("request failed"); error.response = { status }; throw error; } };
+    const reader = createGitHubReader(client, { token: FAKE_READ_TOKEN });
+    await assert.rejects(reader.readText("data/latest/status.json"),
+      (error) => error.code === "github_read_failed" && error.message.includes(`HTTP ${status}`));
+  });
+}
+
+test("private reader network failure fails closed", async () => {
+  const client = { async get() { throw new Error("socket failed"); } };
+  const reader = createGitHubReader(client, { token: FAKE_READ_TOKEN });
+  await assert.rejects(reader.readText("data/latest/status.json"),
+    (error) => error.code === "github_read_failed");
+});
+
+test("private reader timeout fails closed", async () => {
+  const client = { async get() { const error = new Error("timed out"); error.code = "ECONNABORTED"; throw error; } };
+  const reader = createGitHubReader(client, { token: FAKE_READ_TOKEN });
+  await assert.rejects(reader.readText("data/latest/status.json"),
+    (error) => error.code === "github_read_failed");
+});
+
+test("malformed Contents API response fails closed", async () => {
+  const reader = createGitHubReader(httpClientReturning({ type: "dir", path: "data/latest/status.json" }),
+    { token: FAKE_READ_TOKEN });
+  await assert.rejects(reader.readText("data/latest/status.json"),
+    (error) => error.code === "github_response_invalid");
+});
+
+test("Contents API path mismatch fails closed", async () => {
+  const payload = apiFile("data/latest/not-status.json", statusFixture());
+  const reader = createGitHubReader(httpClientReturning(payload), { token: FAKE_READ_TOKEN });
+  await assert.rejects(reader.readText("data/latest/status.json"),
+    (error) => error.code === "github_response_invalid");
+});
+
+test("malformed Contents API base64 fails closed", async () => {
+  const payload = { type: "file", path: "data/latest/status.json", encoding: "base64", content: "%%%not-base64%%%" };
+  const reader = createGitHubReader(httpClientReturning(payload), { token: FAKE_READ_TOKEN });
+  await assert.rejects(reader.readText("data/latest/status.json"),
+    (error) => error.code === "base64_decode_failed");
+});
+
+test("malformed decoded JSON fails closed", async () => {
+  const path = "data/latest/status.json";
+  const reader = createGitHubReader(httpClientReturning(apiFile(path, "{not-json")), { token: FAKE_READ_TOKEN });
+  await assert.rejects(runPremarketGate({ reader, now: WEDNESDAY_MORNING }),
+    (error) => error.code === "json_parse_error");
+});
+
+test("normal Contents API response decodes JSON text", async () => {
+  const path = "data/latest/status.json";
+  const expected = statusFixture();
+  const reader = createGitHubReader(httpClientReturning(apiFile(path, expected)), { token: FAKE_READ_TOKEN });
+  assert.deepEqual(JSON.parse(await reader.readText(path)), expected);
+});
+
+test("private token is absent from diagnostics", async () => {
+  const client = { async get() { const error = new Error(FAKE_READ_TOKEN); error.response = { status: 401 }; throw error; } };
+  const reader = createGitHubReader(client, { token: FAKE_READ_TOKEN });
+  let diagnostic;
+  await withTestServer({ reader }, async (base) => {
+    const response = await fetch(`${base}/cron/premarket`, {
+      method: "POST",
+      headers: { "X-Cron-Key": "test-cron-key" },
+    });
+    diagnostic = await response.json();
+  });
+  assert.equal(JSON.stringify(diagnostic).includes(FAKE_READ_TOKEN), false);
+});
+
+test("private token is absent from logs and error messages", async () => {
+  const client = { async get() { throw new Error(FAKE_READ_TOKEN); } };
+  const reader = createGitHubReader(client, { token: FAKE_READ_TOKEN });
+  let caught;
+  try { await reader.readText("data/latest/status.json"); } catch (error) { caught = error; }
+  assert.ok(caught);
+  assert.equal(caught.message.includes(FAKE_READ_TOKEN), false);
+
+  const originalError = console.error;
+  const logged = [];
+  console.error = (...values) => logged.push(values.join(" "));
+  try {
+    await withTestServer({ reader }, async (base) => {
+      await fetch(`${base}/cron/premarket`, {
+        method: "POST",
+        headers: { "X-Cron-Key": "test-cron-key" },
+      });
+    });
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(logged.join("\n").includes(FAKE_READ_TOKEN), false);
+});
+
+test("production private reader has no Raw URL fallback", () => {
+  const fs = require("node:fs");
+  const source = fs.readFileSync(require.resolve("../modules/premarket"), "utf8");
+  assert.equal(source.includes("raw.githubusercontent.com"), false);
+  assert.equal(source.includes("api.github.com/repos/"), true);
 });

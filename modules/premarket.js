@@ -157,25 +157,62 @@ function validateHistory(history, previousTradingDate) {
   }
 }
 
-function rawGitHubUrl(path) {
-  return `https://raw.githubusercontent.com/${SOURCE_REPOSITORY}/${SOURCE_BRANCH}/${path}`;
+function contentsApiUrl(path) {
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  return `https://api.github.com/repos/${SOURCE_REPOSITORY}/contents/${encodedPath}?ref=${encodeURIComponent(SOURCE_BRANCH)}`;
 }
 
-function createGitHubReader(httpClient = axios) {
+function decodeContentsApiFile(payload, expectedPath) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new PremarketGateError("github_response_invalid", "GitHub Contents API response is not a file object");
+  }
+  if (payload.type !== "file" || payload.path !== expectedPath || payload.encoding !== "base64" ||
+      typeof payload.content !== "string") {
+    throw new PremarketGateError("github_response_invalid", `GitHub Contents API returned an invalid file for ${expectedPath}`);
+  }
+
+  const encoded = payload.content.replace(/\s/g, "");
+  if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    throw new PremarketGateError("base64_decode_failed", `GitHub Contents API returned invalid base64 for ${expectedPath}`);
+  }
+  try {
+    const decoded = Buffer.from(encoded, "base64");
+    if (decoded.toString("base64") !== encoded) {
+      throw new Error("non-canonical base64");
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+  } catch {
+    throw new PremarketGateError("base64_decode_failed", `GitHub Contents API could not decode ${expectedPath}`);
+  }
+}
+
+function createGitHubReader(httpClient = axios, options = {}) {
+  const configuredToken = Object.prototype.hasOwnProperty.call(options, "token")
+    ? options.token
+    : process.env.CHENCAI_POSTMARKET_READ_TOKEN;
+
   return {
     async readText(path) {
+      const token = typeof configuredToken === "string" ? configuredToken.trim() : "";
+      if (!token) {
+        throw new PremarketGateError(
+          "missing_read_token",
+          "CHENCAI_POSTMARKET_READ_TOKEN is not configured"
+        );
+      }
       try {
-        const response = await httpClient.get(rawGitHubUrl(path), {
+        const response = await httpClient.get(contentsApiUrl(path), {
           timeout: 20000,
-          responseType: "text",
-          transformResponse: [(data) => data],
           headers: {
-            Accept: "application/vnd.github.raw+json",
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${token}`,
+            "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "orbit07-premarket-gate",
           },
         });
-        return response.data;
+        return decodeContentsApiFile(response?.data, path);
       } catch (error) {
+        if (error instanceof PremarketGateError) throw error;
         const status = error?.response?.status;
         throw new PremarketGateError(
           "github_read_failed",
@@ -253,6 +290,9 @@ module.exports = {
   OFFICIAL_CHECKS,
   PremarketGateError,
   STATUS_PATH,
+  contentsApiUrl,
+  createGitHubReader,
+  decodeContentsApiFile,
   determinePreviousTradingDate,
   failureDiagnostic,
   mountPremarket,
