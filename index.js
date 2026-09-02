@@ -46,6 +46,10 @@ function requireKey(req, res) {
   if (!k || k !== CRON_KEY) { res.status(401).json({ ok:false, error:"invalid key" }); return false; }
   return true;
 }
+
+// 正式盤前 Stage 1：只讀官方盤後資料並回傳驗證結果，不進行分析或推播。
+require("./modules/premarket").mountPremarket(app, { requireKey });
+
 function verifyTelegram(req, res) {
   const token = req.headers["x-telegram-bot-api-secret-token"];
   if (!WEBHOOK_SECRET) { res.status(500).json({ ok:false, error:"server missing WEBHOOK_SECRET" }); return false; }
