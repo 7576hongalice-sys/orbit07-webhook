@@ -1,9 +1,8 @@
-name: ORBIT07 - Premarket Gate (07:20/07:30/07:40 TPE)
+name: ORBIT07 - Premarket Gate (07:30 TPE)
 
 on:
   schedule:
-    # GitHub cron is UTC. Retry around the 07:30 TPE navigation window.
-    - cron: '20,30,40 23 * * 0-4'   # UTC Sun-Thu 23:20/23:30/23:40 = TPE Mon-Fri 07:20/07:30/07:40
+    - cron: '30 23 * * 0-4'   # UTC Sun-Thu 23:30 = TPE Mon-Fri 07:30
   workflow_dispatch: {}
 
 concurrency:
