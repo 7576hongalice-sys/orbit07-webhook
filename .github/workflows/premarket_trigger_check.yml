@@ -1,0 +1,27 @@
+name: Premarket trigger configuration check
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/cron_morning.yml'
+      - '.github/workflows/premarket_trigger_check.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate premarket retry schedule and endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE=.github/workflows/cron_morning.yml
+          grep -F "20,30,40 23 * * 0-4" "$FILE"
+          grep -F 'POST /cron/premarket' "$FILE"
+          grep -F 'X-Cron-Key: $CRON_KEY' "$FILE"
+          grep -F 'cancel-in-progress: false' "$FILE"
+          echo 'Premarket trigger configuration is valid.'
